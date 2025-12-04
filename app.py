@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
+import unicodedata
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
 from scipy.spatial.distance import cdist
@@ -13,8 +14,14 @@ st.set_page_config(page_title="Roteirizador de Preventivas", layout="wide")
 st.title("🚚 Roteirizador Inteligente de Preventivas")
 st.markdown("Faça o upload das planilhas para gerar a programação automática com separação de habilidades.")
 
+# --- FUNÇÃO DE NORMALIZAÇÃO DE TEXTO (Tirar acentos) ---
+def remover_acentos(texto):
+    if not isinstance(texto, str):
+        return str(texto) if pd.notna(texto) else ""
+    # Normaliza para decompor caracteres (ex: 'ç' vira 'c' + cedilha) e remove não-ASCII
+    return unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
+
 # --- INICIALIZAÇÃO DA MEMÓRIA (SESSION STATE) ---
-# Garante que as variáveis existem antes de qualquer coisa
 if 'dados_gerados' not in st.session_state:
     st.session_state.dados_gerados = False
 if 'df_final' not in st.session_state:
@@ -57,10 +64,13 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     # --- 1. PREPARAR SITES ---
     status_text.text("1/6: Padronizando endereços...")
     if 'ENDEREÇO + CEP' in df_sites.columns:
-        df_sites[['Endereco_Limpo', 'CEP_Limpo']] = df_sites['ENDEREÇO + CEP'].str.extract(r'(.*?)[\s-]*(\d{2}\.?\d{3}-?\d{3})$')
+        # Tenta extrair. Se falhar, fillna garante que pegamos o texto original
+        extracao = df_sites['ENDEREÇO + CEP'].str.extract(r'(.*?)[\s-]*(\d{2}\.?\d{3}-?\d{3})$')
+        df_sites['Endereco_Limpo'] = extracao[0].fillna(df_sites['ENDEREÇO + CEP']) # Fallback para original
+        df_sites['CEP_Limpo'] = extracao[1].fillna('')
     else:
         df_sites['Endereco_Limpo'] = df_sites.iloc[:, 0].astype(str)
-        df_sites['CEP_Limpo'] = '00000-000'
+        df_sites['CEP_Limpo'] = ''
         
     cols_geo = ['latitude', 'longitude']
     for col in cols_geo:
@@ -71,7 +81,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     # --- 2. PREPARAR EQUIPES ---
     status_text.text("2/6: Mapeando habilidades dos técnicos...")
     if 'latitude' not in df_tecnicos.columns:
-        geolocator = Nominatim(user_agent="app_roteirizador_v6_fix")
+        geolocator = Nominatim(user_agent="app_roteirizador_v7_fix")
         geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
         df_tecnicos['temp_geo'] = df_tecnicos.apply(lambda x: geocode(f"{x['cep']}, Brasil"), axis=1)
         df_tecnicos['latitude'] = df_tecnicos['temp_geo'].apply(lambda x: x.latitude if x else None)
@@ -228,7 +238,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
         df_final['Semana'] = agendamento['Semana']
     
     # --- 7. GERAÇÃO DO RELATÓRIO DETALHADO (EXPLOSÃO DE LINHAS) ---
-    status_text.text("6/6: Gerando relatório detalhado...")
+    status_text.text("6/6: Gerando relatório detalhado e limpando caracteres...")
     
     linhas_detalhadas = []
     for _, row in df_final.iterrows():
@@ -237,6 +247,9 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
             'Semana': row['Semana'],
             'Sigla Site': row['sigla_site'],
             'Endereço': row['Endereco_Limpo'],
+            'CEP': row['CEP_Limpo'],
+            'Latitude': row['latitude'],
+            'Longitude': row['longitude'],
             'Equipe': row['Equipe_ID'],
             'Técnico': row['Tecnico_Executante']
         }
@@ -269,6 +282,12 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
             linhas_detalhadas.append(r1)
             
     df_export = pd.DataFrame(linhas_detalhadas)
+    
+    # --- LIMPEZA DE ACENTOS (NORMALIZAÇÃO) ---
+    # Aplica a função remover_acentos em todas as células de texto
+    cols_texto = df_export.select_dtypes(include=['object']).columns
+    for col in cols_texto:
+        df_export[col] = df_export[col].apply(remover_acentos)
     
     bar.progress(100)
     status_text.empty()
@@ -321,9 +340,9 @@ if st.session_state.dados_gerados:
         col2.metric("Equipes Ativas", len(df_equipes_final))
         st.dataframe(df_export.sort_values(by=['Data Programada', 'Equipe']))
         
-        # Download
-        csv = df_export.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Baixar Planilha Final (CSV)", data=csv, file_name='roteiro_detalhado.csv', mime='text/csv')
+        # Download (Usando UTF-8-SIG para Excel abrir sem erros mesmo sem normalização, mas já normalizamos)
+        csv = df_export.to_csv(index=False, sep=';', decimal=',').encode('utf-8-sig')
+        st.download_button("📥 Baixar Planilha Final (CSV Excel)", data=csv, file_name='roteiro_detalhado.csv', mime='text/csv')
     
     st.subheader("🗺️ Mapa da Operação")
     if df_final is not None and not df_final.empty:

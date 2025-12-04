@@ -14,12 +14,17 @@ st.title("🚚 Roteirizador Inteligente de Preventivas")
 st.markdown("Faça o upload das planilhas para gerar a programação automática com separação de habilidades.")
 
 # --- INICIALIZAÇÃO DA MEMÓRIA (SESSION STATE) ---
+# Garante que as variáveis existem antes de qualquer coisa
 if 'dados_gerados' not in st.session_state:
     st.session_state.dados_gerados = False
-    st.session_state.df_final = None # Visão Roteiro (Agrupada)
-    st.session_state.df_export = None # Visão Relatório (Detalhada)
-    st.session_state.df_equipes = None
-    st.session_state.df_erros = None
+if 'df_final' not in st.session_state:
+    st.session_state.df_final = pd.DataFrame()
+if 'df_export' not in st.session_state:
+    st.session_state.df_export = pd.DataFrame()
+if 'df_equipes' not in st.session_state:
+    st.session_state.df_equipes = pd.DataFrame()
+if 'df_erros' not in st.session_state:
+    st.session_state.df_erros = pd.DataFrame()
 
 # --- BARRA LATERAL (UPLOADS) ---
 with st.sidebar:
@@ -29,16 +34,21 @@ with st.sidebar:
     file_tec = st.file_uploader("Base de Técnicos (tecnicos.xlsx)", type=["xlsx"])
     
     if st.button("🧹 Limpar Tudo"):
-        st.session_state.dados_gerados = False
+        for key in st.session_state.keys():
+            del st.session_state[key]
         st.rerun()
 
 # --- FUNÇÕES DE PROCESSAMENTO ---
 @st.cache_data
 def carregar_dados(f_sites, f_prev, f_tec):
-    df_s = pd.read_excel(f_sites)
-    df_p = pd.read_excel(f_prev)
-    df_t = pd.read_excel(f_tec)
-    return df_s, df_p, df_t
+    try:
+        df_s = pd.read_excel(f_sites)
+        df_p = pd.read_excel(f_prev)
+        df_t = pd.read_excel(f_tec)
+        return df_s, df_p, df_t
+    except Exception as e:
+        st.error(f"Erro ao carregar arquivos: {e}")
+        return None, None, None
 
 def processar_roteiro(df_sites, df_prev, df_tecnicos):
     status_text = st.empty()
@@ -61,7 +71,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     # --- 2. PREPARAR EQUIPES ---
     status_text.text("2/6: Mapeando habilidades dos técnicos...")
     if 'latitude' not in df_tecnicos.columns:
-        geolocator = Nominatim(user_agent="app_roteirizador_v6")
+        geolocator = Nominatim(user_agent="app_roteirizador_v6_fix")
         geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
         df_tecnicos['temp_geo'] = df_tecnicos.apply(lambda x: geocode(f"{x['cep']}, Brasil"), axis=1)
         df_tecnicos['latitude'] = df_tecnicos['temp_geo'].apply(lambda x: x.latitude if x else None)
@@ -134,7 +144,9 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     sites_encontrados = set(df_roteiro['sigla_site'])
     df_erros = df_missoes[~df_missoes['sigla_site'].isin(sites_encontrados)].copy()
     df_erros['Motivo_Erro'] = 'Endereço não localizado (Sigla não bate com Base de Sites)'
-    df_erros = df_erros[['sigla_site', 'Detalhe_Visita', 'Motivo_Erro']]
+    if not df_erros.empty:
+        df_erros = df_erros[['sigla_site', 'Detalhe_Visita', 'Motivo_Erro']]
+    
     bar.progress(65)
 
     # --- 5. ROTEIRIZAÇÃO ---
@@ -220,7 +232,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     
     linhas_detalhadas = []
     for _, row in df_final.iterrows():
-        # Dados Base da Visita
         base = {
             'Data Programada': row['Data_Programada'],
             'Semana': row['Semana'],
@@ -232,32 +243,25 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
         
         detalhe = row['Detalhe_Visita']
         
-        # Lógica de Explosão
         if 'DUPLA' in detalhe:
-            # Cria linha para Climatização
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Climatizacao'
             r1['Execução'] = 'Dupla'
             linhas_detalhadas.append(r1)
-            
-            # Cria linha para Energia
             r2 = base.copy()
             r2['Tipo de Preventiva'] = 'Preventiva infra - Energia'
             r2['Execução'] = 'Dupla'
             linhas_detalhadas.append(r2)
-            
         elif 'SOLO (Clima)' in detalhe:
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Climatizacao'
             r1['Execução'] = 'Único'
             linhas_detalhadas.append(r1)
-            
         elif 'SOLO (Energia)' in detalhe:
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Energia'
             r1['Execução'] = 'Único'
             linhas_detalhadas.append(r1)
-            
         elif 'ZELADORIA' in detalhe:
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Zeladoria'
@@ -275,14 +279,16 @@ if file_sites and file_prev and file_tec:
     if st.button("🚀 Gerar Programação"):
         try:
             df_s, df_p, df_t = carregar_dados(file_sites, file_prev, file_tec)
-            df_final, df_equipes_final, df_erros, df_export = processar_roteiro(df_s, df_p, df_t)
-            
-            # SALVA TUDO NA MEMÓRIA
-            st.session_state.df_final = df_final
-            st.session_state.df_export = df_export
-            st.session_state.df_equipes = df_equipes_final
-            st.session_state.df_erros = df_erros
-            st.session_state.dados_gerados = True
+            if df_s is not None:
+                df_final, df_equipes_final, df_erros, df_export = processar_roteiro(df_s, df_p, df_t)
+                
+                # SALVA TUDO NA MEMÓRIA
+                st.session_state.df_final = df_final
+                st.session_state.df_export = df_export
+                st.session_state.df_equipes = df_equipes_final
+                st.session_state.df_erros = df_erros
+                st.session_state.dados_gerados = True
+                st.rerun() # Recarrega a página para mostrar os resultados
             
         except Exception as e:
             st.error(f"Erro no processamento: {e}")
@@ -309,19 +315,19 @@ if st.session_state.dados_gerados:
 
     st.subheader("📊 Visão Geral")
     col1, col2 = st.columns(2)
-    # Mostra o total de tarefas individuais agora, não só visitas
-    col1.metric("Preventivas Individuais", len(df_export))
-    col2.metric("Equipes Ativas", len(df_equipes_final))
     
-    # Mostra a tabela detalhada (Explodida)
-    st.dataframe(df_export.sort_values(by=['Data Programada', 'Equipe']))
+    if df_export is not None:
+        col1.metric("Preventivas Individuais", len(df_export))
+        col2.metric("Equipes Ativas", len(df_equipes_final))
+        st.dataframe(df_export.sort_values(by=['Data Programada', 'Equipe']))
+        
+        # Download
+        csv = df_export.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Baixar Planilha Final (CSV)", data=csv, file_name='roteiro_detalhado.csv', mime='text/csv')
     
     st.subheader("🗺️ Mapa da Operação")
-    st.map(df_final[['latitude', 'longitude']].dropna())
-    
-    # Download do arquivo DETALHADO
-    csv = df_export.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Baixar Planilha Final (CSV)", data=csv, file_name='roteiro_detalhado.csv', mime='text/csv')
+    if df_final is not None and not df_final.empty:
+        st.map(df_final[['latitude', 'longitude']].dropna())
 
 elif not (file_sites and file_prev and file_tec):
     st.info("Por favor, faça o upload das 3 planilhas para iniciar.")

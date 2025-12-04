@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Roteirizador de Preventivas", layout="wide")
 
 st.title("🚚 Roteirizador Inteligente de Preventivas")
-st.markdown("Faça o upload das planilhas para gerar a programação automática de rotas.")
+st.markdown("Faça o upload das planilhas para gerar a programação automática de Preventivas")
 
 # --- BARRA LATERAL (UPLOADS) ---
 with st.sidebar:
@@ -32,8 +32,8 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     status_text = st.empty()
     bar = st.progress(0)
 
-    # --- 1. PREPARAR SITES (LIMPEZA) ---
-    status_text.text("1/5: Padronizando endereços e coordenadas dos sites...")
+    # --- 1. PREPARAR SITES ---
+    status_text.text("1/5: Padronizando endereços...")
     if 'ENDEREÇO + CEP' in df_sites.columns:
         df_sites[['Endereco_Limpo', 'CEP_Limpo']] = df_sites['ENDEREÇO + CEP'].str.extract(r'(.*?)[\s-]*(\d{2}\.?\d{3}-?\d{3})$')
     else:
@@ -46,53 +46,69 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     df_sites = df_sites.dropna(subset=cols_geo)
     bar.progress(20)
 
-    # --- 2. PREPARAR EQUIPES ---
-    status_text.text("2/5: Processando localização e perfil das equipes...")
+    # --- 2. PREPARAR EQUIPES (COM DETALHE DE QUEM FAZ O QUÊ) ---
+    status_text.text("2/5: Mapeando habilidades dos técnicos...")
     
-    # Geolocalização (Simplificada)
+    # Geolocalização
     if 'latitude' not in df_tecnicos.columns:
-        geolocator = Nominatim(user_agent="app_roteirizador_v3")
+        geolocator = Nominatim(user_agent="app_roteirizador_v4")
         geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
         df_tecnicos['temp_geo'] = df_tecnicos.apply(lambda x: geocode(f"{x['cep']}, Brasil"), axis=1)
         df_tecnicos['latitude'] = df_tecnicos['temp_geo'].apply(lambda x: x.latitude if x else None)
         df_tecnicos['longitude'] = df_tecnicos['temp_geo'].apply(lambda x: x.longitude if x else None)
 
-    # Agrupar técnicos
-    df_equipes = df_tecnicos.groupby('equipe').agg({
-        'nome_tecnico': lambda x: ' & '.join(x.astype(str)),
-        'tipo_preventiva': lambda x: ', '.join(x.unique()),
-        'latitude': 'mean',
-        'longitude': 'mean'
-    }).reset_index()
-    df_equipes.rename(columns={'nome_tecnico': 'Integrantes'}, inplace=True)
+    # Função para mapear nomes às funções dentro da equipe
+    def mapear_integrantes(subdf):
+        # Cria um dicionário ex: {'Climatizacao': 'Marcelo', 'Energia': 'Gustavo'}
+        mapa = {}
+        todos_nomes = []
+        for _, row in subdf.iterrows():
+            todos_nomes.append(str(row['nome_tecnico']))
+            # Identifica a skill principal
+            skill = str(row['tipo_preventiva'])
+            if 'Climatizacao' in skill: mapa['CLIMA'] = row['nome_tecnico']
+            elif 'Energia' in skill: mapa['ENERGIA'] = row['nome_tecnico']
+            elif 'Zeladoria' in skill: mapa['ZELADORIA'] = row['nome_tecnico']
+        
+        # Guarda o mapa e a lista completa
+        return pd.Series({
+            'Integrantes_Lista': ' & '.join(unique_preserve_order(todos_nomes)),
+            'Mapa_Skills': mapa,
+            'latitude': subdf['latitude'].mean(),
+            'longitude': subdf['longitude'].mean(),
+            'Todas_Skills': ', '.join(subdf['tipo_preventiva'].unique())
+        })
 
-    # Lógica interna de classificação (Invisível para o usuário)
+    def unique_preserve_order(seq):
+        seen = set()
+        seen_add = seen.add
+        return [x for x in seq if not (x in seen or seen_add(x))]
+
+    df_equipes = df_tecnicos.groupby('equipe').apply(mapear_integrantes).reset_index()
+
+    # Define especialidade da equipe (para roteamento macro)
     def definir_especialidade(skills):
-        if 'Zeladoria' in skills:
-            return 'ZELADORIA'
-        else:
-            return 'TECNICA'
+        if 'Zeladoria' in skills: return 'ZELADORIA'
+        else: return 'TECNICA'
             
-    df_equipes['Especialidade'] = df_equipes['tipo_preventiva'].apply(definir_especialidade)
+    df_equipes['Especialidade'] = df_equipes['Todas_Skills'].apply(definir_especialidade)
     bar.progress(40)
 
     # --- 3. PREPARAR TAREFAS ---
-    status_text.text("3/5: Organizando lista de demandas...")
+    status_text.text("3/5: Classificando visitas (Solo vs Dupla)...")
     
-    # Filtra geradores
     df_prev = df_prev[~df_prev['tipo_preventiva'].str.contains('Gerador', case=False, na=False)].copy()
     
-    # Separação interna dos mundos (Logica mantida, mas silenciosa)
+    # Separação Zeladoria
     mask_zeladoria = df_prev['tipo_preventiva'].str.contains('Zeladoria', case=False)
     df_zeladoria = df_prev[mask_zeladoria].copy()
     df_tecnica = df_prev[~mask_zeladoria].copy()
     
-    # Agrupar Tarefas
-    tarefas_zeladoria = df_zeladoria.groupby('sigla_site').agg({
-        'tipo_preventiva': lambda x: 'Zeladoria'
-    }).reset_index()
+    # Agrupar Zeladoria
+    tarefas_zeladoria = df_zeladoria.groupby('sigla_site').agg({'tipo_preventiva': lambda x: 'Zeladoria'}).reset_index()
     tarefas_zeladoria['Tipo_Visita'] = 'ZELADORIA'
     
+    # Agrupar Técnica (Define se é Solo ou Dupla)
     def classificar_tecnica(lista_prevs):
         texto = ', '.join(lista_prevs)
         tem_clima = 'Climatizacao' in texto
@@ -101,16 +117,18 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
         elif tem_clima: return 'SOLO (Clima)'
         else: return 'SOLO (Energia)'
 
-    tarefas_tecnica = df_tecnica.groupby('sigla_site').agg({
-        'tipo_preventiva': classificar_tecnica
-    }).reset_index()
+    tarefas_tecnica = df_tecnica.groupby('sigla_site').agg({'tipo_preventiva': classificar_tecnica}).reset_index()
     tarefas_tecnica['Tipo_Visita'] = 'TECNICA'
+    
+    # Guarda o detalhe específico (Ex: "SOLO (Clima)") numa coluna auxiliar para usar depois
+    tarefas_tecnica['Detalhe_Visita'] = tarefas_tecnica['tipo_preventiva'] 
+    tarefas_zeladoria['Detalhe_Visita'] = 'ZELADORIA'
 
     df_missoes = pd.concat([tarefas_zeladoria, tarefas_tecnica], ignore_index=True)
     bar.progress(60)
 
     # --- 4. CRUZAMENTO ---
-    status_text.text("4/5: Cruzando dados com base de endereços...")
+    status_text.text("4/5: Cruzando com endereços...")
     
     cols_ids = [c for c in ['ID_EBT', 'ID_CLARO_FIXO', 'ID_NET', 'ID_CLARO_OMR'] if c in df_sites.columns]
     df_sites_long = df_sites.melt(id_vars=['latitude', 'longitude', 'Endereco_Limpo', 'CEP_Limpo'], value_vars=cols_ids, value_name='ID_Unico').dropna(subset=['ID_Unico'])
@@ -120,23 +138,26 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     bar.progress(80)
 
     # --- 5. ROTEIRIZAÇÃO ---
-    status_text.text("5/5: Calculando rotas otimizadas e agendamentos...")
+    status_text.text("5/5: Otimizando rotas...")
     
+    # Separa os fluxos
     roteiro_zel = df_roteiro[df_roteiro['Tipo_Visita'] == 'ZELADORIA'].copy()
     equipes_zel = df_equipes[df_equipes['Especialidade'] == 'ZELADORIA'].copy()
     
     roteiro_tec = df_roteiro[df_roteiro['Tipo_Visita'] == 'TECNICA'].copy()
     equipes_tec = df_equipes[df_equipes['Especialidade'] == 'TECNICA'].copy()
     
-    def distribuir(df_tarefas, df_eqs, produtividade=2):
-        if len(df_eqs) == 0 or len(df_tarefas) == 0:
-            return df_tarefas
+    def distribuir(df_tarefas, df_eqs):
+        if len(df_eqs) == 0 or len(df_tarefas) == 0: return df_tarefas
+        
         sites_por_eq = math.ceil(len(df_tarefas) / len(df_eqs))
         coords_t = df_tarefas[['latitude', 'longitude']].values
         coords_e = df_eqs[['latitude', 'longitude']].values
         matriz = cdist(coords_t, coords_e, metric='euclidean')
+        
         ocupacao = np.zeros(len(df_eqs), dtype=int)
         designacao = [-1] * len(df_tarefas)
+        
         for i in range(len(df_tarefas)):
             dists = matriz[i]
             for eq_idx in np.argsort(dists):
@@ -144,8 +165,36 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
                     designacao[i] = eq_idx
                     ocupacao[eq_idx] += 1
                     break
+        
+        # Atribuição da Equipe
         df_tarefas['Equipe_ID'] = [df_eqs.iloc[x]['equipe'] if x >= 0 else 'SEM EQUIPE' for x in designacao]
-        df_tarefas['Tecnicos'] = [df_eqs.iloc[x]['Integrantes'] if x >= 0 else '-' for x in designacao]
+        
+        # Lógica de SELEÇÃO DO TÉCNICO (O Pulo do Gato)
+        tecnicos_finais = []
+        for x, row_tarefa in zip(designacao, df_tarefas.itertuples()):
+            if x < 0:
+                tecnicos_finais.append('-')
+                continue
+            
+            equipe_dados = df_eqs.iloc[x]
+            mapa = equipe_dados['Mapa_Skills']
+            detalhe = row_tarefa.Detalhe_Visita # Ex: SOLO (Clima)
+            
+            # Decide quem vai baseado na tarefa
+            if 'Clima' in detalhe and 'Energia' in detalhe: # DUPLA
+                nome = equipe_dados['Integrantes_Lista']
+            elif 'Clima' in detalhe: # SOLO CLIMA
+                nome = mapa.get('CLIMA', equipe_dados['Integrantes_Lista'])
+            elif 'Energia' in detalhe: # SOLO ENERGIA
+                nome = mapa.get('ENERGIA', equipe_dados['Integrantes_Lista'])
+            elif 'Zeladoria' in detalhe:
+                nome = mapa.get('ZELADORIA', equipe_dados['Integrantes_Lista'])
+            else:
+                nome = equipe_dados['Integrantes_Lista']
+            
+            tecnicos_finais.append(nome)
+            
+        df_tarefas['Tecnico_Executante'] = tecnicos_finais
         return df_tarefas
 
     roteiro_zel_pronto = distribuir(roteiro_zel, equipes_zel)
@@ -193,16 +242,19 @@ if file_sites and file_prev and file_tec:
             
             st.subheader("📊 Resumo Executivo")
             col1, col2 = st.columns(2)
-            col1.metric("Total de Visitas Programadas", len(df_final))
-            col2.metric("Total de Equipes Ativas", len(df_equipes_final))
+            col1.metric("Total de Visitas", len(df_final))
+            col2.metric("Equipes Ativas", len(df_equipes_final))
             
-            st.dataframe(df_final[['Data_Programada', 'Equipe_ID', 'Tecnicos', 'sigla_site', 'Tipo_Visita', 'Endereco_Limpo']].sort_values(by=['Data_Programada', 'Equipe_ID']))
+            # Mostra a tabela com a nova coluna "Tecnico_Executante"
+            st.dataframe(df_final[['Data_Programada', 'Equipe_ID', 'Tecnico_Executante', 'sigla_site', 'Detalhe_Visita', 'Endereco_Limpo']].sort_values(by=['Data_Programada', 'Equipe_ID']))
             
-            # Botão Download
+            st.subheader("🗺️ Mapa da Operação")
+            st.map(df_final[['latitude', 'longitude']].dropna())
+            
             csv = df_final.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Baixar Planilha Final (CSV)", data=csv, file_name='roteiro_oficial.csv', mime='text/csv')
             
         except Exception as e:
-            st.error(f"Ocorreu um erro durante o processamento: {e}")
+            st.error(f"Erro no processamento: {e}")
 else:
     st.info("Por favor, faça o upload das 3 planilhas para iniciar.")

@@ -16,7 +16,8 @@ st.markdown("Faça o upload das planilhas para gerar a programação automática
 # --- INICIALIZAÇÃO DA MEMÓRIA (SESSION STATE) ---
 if 'dados_gerados' not in st.session_state:
     st.session_state.dados_gerados = False
-    st.session_state.df_final = None
+    st.session_state.df_final = None # Visão Roteiro (Agrupada)
+    st.session_state.df_export = None # Visão Relatório (Detalhada)
     st.session_state.df_equipes = None
     st.session_state.df_erros = None
 
@@ -27,7 +28,6 @@ with st.sidebar:
     file_prev = st.file_uploader("Preventivas do Mês (preventivas.xlsx)", type=["xlsx"])
     file_tec = st.file_uploader("Base de Técnicos (tecnicos.xlsx)", type=["xlsx"])
     
-    # Botão de Reset para limpar a memória se quiser começar do zero
     if st.button("🧹 Limpar Tudo"):
         st.session_state.dados_gerados = False
         st.rerun()
@@ -45,7 +45,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     bar = st.progress(0)
 
     # --- 1. PREPARAR SITES ---
-    status_text.text("1/5: Padronizando endereços...")
+    status_text.text("1/6: Padronizando endereços...")
     if 'ENDEREÇO + CEP' in df_sites.columns:
         df_sites[['Endereco_Limpo', 'CEP_Limpo']] = df_sites['ENDEREÇO + CEP'].str.extract(r'(.*?)[\s-]*(\d{2}\.?\d{3}-?\d{3})$')
     else:
@@ -56,13 +56,12 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     for col in cols_geo:
         df_sites[col] = pd.to_numeric(df_sites[col].astype(str).str.replace(',', '.', regex=False), errors='coerce')
     df_sites = df_sites.dropna(subset=cols_geo)
-    bar.progress(20)
+    bar.progress(15)
 
     # --- 2. PREPARAR EQUIPES ---
-    status_text.text("2/5: Mapeando habilidades dos técnicos...")
-    
+    status_text.text("2/6: Mapeando habilidades dos técnicos...")
     if 'latitude' not in df_tecnicos.columns:
-        geolocator = Nominatim(user_agent="app_roteirizador_v5")
+        geolocator = Nominatim(user_agent="app_roteirizador_v6")
         geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
         df_tecnicos['temp_geo'] = df_tecnicos.apply(lambda x: geocode(f"{x['cep']}, Brasil"), axis=1)
         df_tecnicos['latitude'] = df_tecnicos['temp_geo'].apply(lambda x: x.latitude if x else None)
@@ -94,11 +93,10 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
         else: return 'TECNICA'
             
     df_equipes['Especialidade'] = df_equipes['Todas_Skills'].apply(definir_especialidade)
-    bar.progress(40)
+    bar.progress(30)
 
     # --- 3. PREPARAR TAREFAS ---
-    status_text.text("3/5: Classificando visitas...")
-    
+    status_text.text("3/6: Classificando visitas...")
     df_prev = df_prev[~df_prev['tipo_preventiva'].str.contains('Gerador', case=False, na=False)].copy()
     
     mask_zeladoria = df_prev['tipo_preventiva'].str.contains('Zeladoria', case=False)
@@ -123,45 +121,37 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     tarefas_zeladoria['Detalhe_Visita'] = 'ZELADORIA'
 
     df_missoes = pd.concat([tarefas_zeladoria, tarefas_tecnica], ignore_index=True)
-    bar.progress(60)
+    bar.progress(50)
 
-    # --- 4. CRUZAMENTO & GERAÇÃO DE ERROS ---
-    status_text.text("4/5: Cruzando com endereços...")
-    
+    # --- 4. CRUZAMENTO & ERROS ---
+    status_text.text("4/6: Cruzando com endereços...")
     cols_ids = [c for c in ['ID_EBT', 'ID_CLARO_FIXO', 'ID_NET', 'ID_CLARO_OMR'] if c in df_sites.columns]
     df_sites_long = df_sites.melt(id_vars=['latitude', 'longitude', 'Endereco_Limpo', 'CEP_Limpo'], value_vars=cols_ids, value_name='ID_Unico').dropna(subset=['ID_Unico'])
     
     df_roteiro = pd.merge(df_sites_long, df_missoes, left_on='ID_Unico', right_on='sigla_site', how='inner')
     df_roteiro = df_roteiro.drop_duplicates(subset=['sigla_site', 'Tipo_Visita'])
     
-    # >>> LÓGICA DE DETECÇÃO DE ERROS <<<
     sites_encontrados = set(df_roteiro['sigla_site'])
     df_erros = df_missoes[~df_missoes['sigla_site'].isin(sites_encontrados)].copy()
     df_erros['Motivo_Erro'] = 'Endereço não localizado (Sigla não bate com Base de Sites)'
     df_erros = df_erros[['sigla_site', 'Detalhe_Visita', 'Motivo_Erro']]
-    
-    bar.progress(80)
+    bar.progress(65)
 
     # --- 5. ROTEIRIZAÇÃO ---
-    status_text.text("5/5: Otimizando rotas...")
-    
+    status_text.text("5/6: Otimizando rotas...")
     roteiro_zel = df_roteiro[df_roteiro['Tipo_Visita'] == 'ZELADORIA'].copy()
     equipes_zel = df_equipes[df_equipes['Especialidade'] == 'ZELADORIA'].copy()
-    
     roteiro_tec = df_roteiro[df_roteiro['Tipo_Visita'] == 'TECNICA'].copy()
     equipes_tec = df_equipes[df_equipes['Especialidade'] == 'TECNICA'].copy()
     
     def distribuir(df_tarefas, df_eqs):
         if len(df_eqs) == 0 or len(df_tarefas) == 0: return df_tarefas
-        
         sites_por_eq = math.ceil(len(df_tarefas) / len(df_eqs))
         coords_t = df_tarefas[['latitude', 'longitude']].values
         coords_e = df_eqs[['latitude', 'longitude']].values
         matriz = cdist(coords_t, coords_e, metric='euclidean')
-        
         ocupacao = np.zeros(len(df_eqs), dtype=int)
         designacao = [-1] * len(df_tarefas)
-        
         for i in range(len(df_tarefas)):
             dists = matriz[i]
             for eq_idx in np.argsort(dists):
@@ -169,7 +159,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
                     designacao[i] = eq_idx
                     ocupacao[eq_idx] += 1
                     break
-        
         df_tarefas['Equipe_ID'] = [df_eqs.iloc[x]['equipe'] if x >= 0 else 'SEM EQUIPE' for x in designacao]
         
         tecnicos_finais = []
@@ -177,11 +166,9 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
             if x < 0:
                 tecnicos_finais.append('-')
                 continue
-            
             equipe_dados = df_eqs.iloc[x]
             mapa = equipe_dados['Mapa_Skills']
             detalhe = row_tarefa.Detalhe_Visita 
-            
             if 'Clima' in detalhe and 'Energia' in detalhe: 
                 nome = equipe_dados['Integrantes_Lista']
             elif 'Clima' in detalhe: 
@@ -192,9 +179,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
                 nome = mapa.get('ZELADORIA', equipe_dados['Integrantes_Lista'])
             else:
                 nome = equipe_dados['Integrantes_Lista']
-            
             tecnicos_finais.append(nome)
-            
         df_tarefas['Tecnico_Executante'] = tecnicos_finais
         return df_tarefas
 
@@ -230,23 +215,71 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
         df_final['Data_Programada'] = pd.to_datetime(agendamento['Data_Programada']).dt.strftime('%d/%m/%Y')
         df_final['Semana'] = agendamento['Semana']
     
-    bar.progress(100)
-    status_text.empty() # Limpa o texto de progresso
-    return df_final, df_equipes, df_erros
-
-# --- LÓGICA DE INTERFACE COM MEMÓRIA ---
-
-# Se os arquivos estiverem carregados, mostra o botão de processar
-if file_sites and file_prev and file_tec:
+    # --- 7. GERAÇÃO DO RELATÓRIO DETALHADO (EXPLOSÃO DE LINHAS) ---
+    status_text.text("6/6: Gerando relatório detalhado...")
     
-    # Botão para (Re)Gerar o Roteiro
+    linhas_detalhadas = []
+    for _, row in df_final.iterrows():
+        # Dados Base da Visita
+        base = {
+            'Data Programada': row['Data_Programada'],
+            'Semana': row['Semana'],
+            'Sigla Site': row['sigla_site'],
+            'Endereço': row['Endereco_Limpo'],
+            'Equipe': row['Equipe_ID'],
+            'Técnico': row['Tecnico_Executante']
+        }
+        
+        detalhe = row['Detalhe_Visita']
+        
+        # Lógica de Explosão
+        if 'DUPLA' in detalhe:
+            # Cria linha para Climatização
+            r1 = base.copy()
+            r1['Tipo de Preventiva'] = 'Preventiva infra - Climatizacao'
+            r1['Execução'] = 'Dupla'
+            linhas_detalhadas.append(r1)
+            
+            # Cria linha para Energia
+            r2 = base.copy()
+            r2['Tipo de Preventiva'] = 'Preventiva infra - Energia'
+            r2['Execução'] = 'Dupla'
+            linhas_detalhadas.append(r2)
+            
+        elif 'SOLO (Clima)' in detalhe:
+            r1 = base.copy()
+            r1['Tipo de Preventiva'] = 'Preventiva infra - Climatizacao'
+            r1['Execução'] = 'Único'
+            linhas_detalhadas.append(r1)
+            
+        elif 'SOLO (Energia)' in detalhe:
+            r1 = base.copy()
+            r1['Tipo de Preventiva'] = 'Preventiva infra - Energia'
+            r1['Execução'] = 'Único'
+            linhas_detalhadas.append(r1)
+            
+        elif 'ZELADORIA' in detalhe:
+            r1 = base.copy()
+            r1['Tipo de Preventiva'] = 'Preventiva infra - Zeladoria'
+            r1['Execução'] = 'Único' 
+            linhas_detalhadas.append(r1)
+            
+    df_export = pd.DataFrame(linhas_detalhadas)
+    
+    bar.progress(100)
+    status_text.empty()
+    return df_final, df_equipes, df_erros, df_export
+
+# --- LÓGICA DE INTERFACE ---
+if file_sites and file_prev and file_tec:
     if st.button("🚀 Gerar Programação"):
         try:
             df_s, df_p, df_t = carregar_dados(file_sites, file_prev, file_tec)
-            df_final, df_equipes_final, df_erros = processar_roteiro(df_s, df_p, df_t)
+            df_final, df_equipes_final, df_erros, df_export = processar_roteiro(df_s, df_p, df_t)
             
             # SALVA TUDO NA MEMÓRIA
             st.session_state.df_final = df_final
+            st.session_state.df_export = df_export
             st.session_state.df_equipes = df_equipes_final
             st.session_state.df_erros = df_erros
             st.session_state.dados_gerados = True
@@ -254,17 +287,17 @@ if file_sites and file_prev and file_tec:
         except Exception as e:
             st.error(f"Erro no processamento: {e}")
 
-# --- MOSTRAR RESULTADOS (Se existirem na memória) ---
+# --- MOSTRAR RESULTADOS ---
 if st.session_state.dados_gerados:
     st.success("Programação ativa!")
     
     df_final = st.session_state.df_final
+    df_export = st.session_state.df_export
     df_erros = st.session_state.df_erros
     df_equipes_final = st.session_state.df_equipes
 
-    # --- ÁREA DE ERROS ---
     if not df_erros.empty:
-        st.warning(f"⚠️ Atenção: {len(df_erros)} sites não foram programados por falta de cadastro.")
+        st.warning(f"⚠️ Atenção: {len(df_erros)} sites não foram programados.")
         with st.expander("Ver Relatório de Erros"):
             st.dataframe(df_erros)
             csv_erros = df_erros.to_csv(index=False).encode('utf-8')
@@ -274,18 +307,21 @@ if st.session_state.dados_gerados:
 
     st.divider()
 
-    st.subheader("📊 Resumo Executivo")
+    st.subheader("📊 Visão Geral")
     col1, col2 = st.columns(2)
-    col1.metric("Visitas Programadas", len(df_final))
+    # Mostra o total de tarefas individuais agora, não só visitas
+    col1.metric("Preventivas Individuais", len(df_export))
     col2.metric("Equipes Ativas", len(df_equipes_final))
     
-    st.dataframe(df_final[['Data_Programada', 'Equipe_ID', 'Tecnico_Executante', 'sigla_site', 'Detalhe_Visita', 'Endereco_Limpo']].sort_values(by=['Data_Programada', 'Equipe_ID']))
+    # Mostra a tabela detalhada (Explodida)
+    st.dataframe(df_export.sort_values(by=['Data Programada', 'Equipe']))
     
     st.subheader("🗺️ Mapa da Operação")
     st.map(df_final[['latitude', 'longitude']].dropna())
     
-    csv = df_final.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Baixar Roteiro Final (CSV)", data=csv, file_name='roteiro_oficial.csv', mime='text/csv')
+    # Download do arquivo DETALHADO
+    csv = df_export.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Baixar Planilha Final (CSV)", data=csv, file_name='roteiro_detalhado.csv', mime='text/csv')
 
 elif not (file_sites and file_prev and file_tec):
     st.info("Por favor, faça o upload das 3 planilhas para iniciar.")

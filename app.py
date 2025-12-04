@@ -13,12 +13,24 @@ st.set_page_config(page_title="Roteirizador de Preventivas", layout="wide")
 st.title("🚚 Roteirizador Inteligente de Preventivas")
 st.markdown("Faça o upload das planilhas para gerar a programação automática com separação de habilidades.")
 
+# --- INICIALIZAÇÃO DA MEMÓRIA (SESSION STATE) ---
+if 'dados_gerados' not in st.session_state:
+    st.session_state.dados_gerados = False
+    st.session_state.df_final = None
+    st.session_state.df_equipes = None
+    st.session_state.df_erros = None
+
 # --- BARRA LATERAL (UPLOADS) ---
 with st.sidebar:
     st.header("📂 Arquivos de Entrada")
     file_sites = st.file_uploader("Base de Sites (sites.xlsx)", type=["xlsx"])
     file_prev = st.file_uploader("Preventivas do Mês (preventivas.xlsx)", type=["xlsx"])
     file_tec = st.file_uploader("Base de Técnicos (tecnicos.xlsx)", type=["xlsx"])
+    
+    # Botão de Reset para limpar a memória se quiser começar do zero
+    if st.button("🧹 Limpar Tudo"):
+        st.session_state.dados_gerados = False
+        st.rerun()
 
 # --- FUNÇÕES DE PROCESSAMENTO ---
 @st.cache_data
@@ -219,42 +231,61 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
         df_final['Semana'] = agendamento['Semana']
     
     bar.progress(100)
-    status_text.success("Processamento concluído!")
+    status_text.empty() # Limpa o texto de progresso
     return df_final, df_equipes, df_erros
 
-# --- INTERFACE ---
+# --- LÓGICA DE INTERFACE COM MEMÓRIA ---
+
+# Se os arquivos estiverem carregados, mostra o botão de processar
 if file_sites and file_prev and file_tec:
+    
+    # Botão para (Re)Gerar o Roteiro
     if st.button("🚀 Gerar Programação"):
         try:
             df_s, df_p, df_t = carregar_dados(file_sites, file_prev, file_tec)
             df_final, df_equipes_final, df_erros = processar_roteiro(df_s, df_p, df_t)
             
-            # --- ÁREA DE ERROS ---
-            if not df_erros.empty:
-                st.warning(f"⚠️ Atenção: {len(df_erros)} sites não foram programados por falta de cadastro.")
-                with st.expander("Ver Relatório de Erros"):
-                    st.dataframe(df_erros)
-                    csv_erros = df_erros.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Baixar Relatório de Erros", data=csv_erros, file_name='relatorio_erros.csv', mime='text/csv')
-            else:
-                st.success("🎉 Sucesso Total: Todos os sites solicitados foram encontrados!")
-
-            st.divider()
-
-            st.subheader("📊 Resumo Executivo")
-            col1, col2 = st.columns(2)
-            col1.metric("Visitas Programadas", len(df_final))
-            col2.metric("Equipes Ativas", len(df_equipes_final))
-            
-            st.dataframe(df_final[['Data_Programada', 'Equipe_ID', 'Tecnico_Executante', 'sigla_site', 'Detalhe_Visita', 'Endereco_Limpo']].sort_values(by=['Data_Programada', 'Equipe_ID']))
-            
-            st.subheader("🗺️ Mapa da Operação")
-            st.map(df_final[['latitude', 'longitude']].dropna())
-            
-            csv = df_final.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Baixar Roteiro Final (CSV)", data=csv, file_name='roteiro_oficial.csv', mime='text/csv')
+            # SALVA TUDO NA MEMÓRIA
+            st.session_state.df_final = df_final
+            st.session_state.df_equipes = df_equipes_final
+            st.session_state.df_erros = df_erros
+            st.session_state.dados_gerados = True
             
         except Exception as e:
             st.error(f"Erro no processamento: {e}")
-else:
+
+# --- MOSTRAR RESULTADOS (Se existirem na memória) ---
+if st.session_state.dados_gerados:
+    st.success("Programação ativa!")
+    
+    df_final = st.session_state.df_final
+    df_erros = st.session_state.df_erros
+    df_equipes_final = st.session_state.df_equipes
+
+    # --- ÁREA DE ERROS ---
+    if not df_erros.empty:
+        st.warning(f"⚠️ Atenção: {len(df_erros)} sites não foram programados por falta de cadastro.")
+        with st.expander("Ver Relatório de Erros"):
+            st.dataframe(df_erros)
+            csv_erros = df_erros.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Baixar Relatório de Erros", data=csv_erros, file_name='relatorio_erros.csv', mime='text/csv')
+    else:
+        st.success("🎉 Sucesso Total: Todos os sites solicitados foram encontrados!")
+
+    st.divider()
+
+    st.subheader("📊 Resumo Executivo")
+    col1, col2 = st.columns(2)
+    col1.metric("Visitas Programadas", len(df_final))
+    col2.metric("Equipes Ativas", len(df_equipes_final))
+    
+    st.dataframe(df_final[['Data_Programada', 'Equipe_ID', 'Tecnico_Executante', 'sigla_site', 'Detalhe_Visita', 'Endereco_Limpo']].sort_values(by=['Data_Programada', 'Equipe_ID']))
+    
+    st.subheader("🗺️ Mapa da Operação")
+    st.map(df_final[['latitude', 'longitude']].dropna())
+    
+    csv = df_final.to_csv(index=False).encode('utf-8')
+    st.download_button("📥 Baixar Roteiro Final (CSV)", data=csv, file_name='roteiro_oficial.csv', mime='text/csv')
+
+elif not (file_sites and file_prev and file_tec):
     st.info("Por favor, faça o upload das 3 planilhas para iniciar.")

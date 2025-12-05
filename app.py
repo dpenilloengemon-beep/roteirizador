@@ -12,16 +12,15 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Roteirizador de Preventivas", layout="wide")
 
 st.title("🚚 Roteirizador Inteligente de Preventivas")
-st.markdown("Faça o upload das planilhas para gerar a programação automática com separação de habilidades.")
+st.markdown("Faça o upload das planilhas para gerar a programação automática.")
 
-# --- FUNÇÃO DE NORMALIZAÇÃO DE TEXTO (Tirar acentos) ---
+# --- FUNÇÃO DE LIMPEZA DE CARACTERES ---
 def remover_acentos(texto):
     if not isinstance(texto, str):
         return str(texto) if pd.notna(texto) else ""
-    # Normaliza para decompor caracteres (ex: 'ç' vira 'c' + cedilha) e remove não-ASCII
     return unicodedata.normalize('NFKD', texto).encode('ASCII', 'ignore').decode('ASCII')
 
-# --- INICIALIZAÇÃO DA MEMÓRIA (SESSION STATE) ---
+# --- INICIALIZAÇÃO DA MEMÓRIA ---
 if 'dados_gerados' not in st.session_state:
     st.session_state.dados_gerados = False
 if 'df_final' not in st.session_state:
@@ -33,7 +32,7 @@ if 'df_equipes' not in st.session_state:
 if 'df_erros' not in st.session_state:
     st.session_state.df_erros = pd.DataFrame()
 
-# --- BARRA LATERAL (UPLOADS) ---
+# --- BARRA LATERAL ---
 with st.sidebar:
     st.header("📂 Arquivos de Entrada")
     file_sites = st.file_uploader("Base de Sites (sites.xlsx)", type=["xlsx"])
@@ -61,12 +60,11 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     status_text = st.empty()
     bar = st.progress(0)
 
-    # --- 1. PREPARAR SITES ---
+    # 1. SITES
     status_text.text("1/6: Padronizando endereços...")
     if 'ENDEREÇO + CEP' in df_sites.columns:
-        # Tenta extrair. Se falhar, fillna garante que pegamos o texto original
         extracao = df_sites['ENDEREÇO + CEP'].str.extract(r'(.*?)[\s-]*(\d{2}\.?\d{3}-?\d{3})$')
-        df_sites['Endereco_Limpo'] = extracao[0].fillna(df_sites['ENDEREÇO + CEP']) # Fallback para original
+        df_sites['Endereco_Limpo'] = extracao[0].fillna(df_sites['ENDEREÇO + CEP']) 
         df_sites['CEP_Limpo'] = extracao[1].fillna('')
     else:
         df_sites['Endereco_Limpo'] = df_sites.iloc[:, 0].astype(str)
@@ -78,10 +76,10 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     df_sites = df_sites.dropna(subset=cols_geo)
     bar.progress(15)
 
-    # --- 2. PREPARAR EQUIPES ---
+    # 2. EQUIPES
     status_text.text("2/6: Mapeando habilidades dos técnicos...")
     if 'latitude' not in df_tecnicos.columns:
-        geolocator = Nominatim(user_agent="app_roteirizador_v7_fix")
+        geolocator = Nominatim(user_agent="app_roteirizador_v9_cont")
         geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1.0)
         df_tecnicos['temp_geo'] = df_tecnicos.apply(lambda x: geocode(f"{x['cep']}, Brasil"), axis=1)
         df_tecnicos['latitude'] = df_tecnicos['temp_geo'].apply(lambda x: x.latitude if x else None)
@@ -115,7 +113,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     df_equipes['Especialidade'] = df_equipes['Todas_Skills'].apply(definir_especialidade)
     bar.progress(30)
 
-    # --- 3. PREPARAR TAREFAS ---
+    # 3. TAREFAS
     status_text.text("3/6: Classificando visitas...")
     df_prev = df_prev[~df_prev['tipo_preventiva'].str.contains('Gerador', case=False, na=False)].copy()
     
@@ -143,7 +141,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     df_missoes = pd.concat([tarefas_zeladoria, tarefas_tecnica], ignore_index=True)
     bar.progress(50)
 
-    # --- 4. CRUZAMENTO & ERROS ---
+    # 4. CRUZAMENTO
     status_text.text("4/6: Cruzando com endereços...")
     cols_ids = [c for c in ['ID_EBT', 'ID_CLARO_FIXO', 'ID_NET', 'ID_CLARO_OMR'] if c in df_sites.columns]
     df_sites_long = df_sites.melt(id_vars=['latitude', 'longitude', 'Endereco_Limpo', 'CEP_Limpo'], value_vars=cols_ids, value_name='ID_Unico').dropna(subset=['ID_Unico'])
@@ -156,10 +154,9 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     df_erros['Motivo_Erro'] = 'Endereço não localizado (Sigla não bate com Base de Sites)'
     if not df_erros.empty:
         df_erros = df_erros[['sigla_site', 'Detalhe_Visita', 'Motivo_Erro']]
-    
     bar.progress(65)
 
-    # --- 5. ROTEIRIZAÇÃO ---
+    # 5. ROTEIRIZAÇÃO
     status_text.text("5/6: Otimizando rotas...")
     roteiro_zel = df_roteiro[df_roteiro['Tipo_Visita'] == 'ZELADORIA'].copy()
     equipes_zel = df_equipes[df_equipes['Especialidade'] == 'ZELADORIA'].copy()
@@ -209,49 +206,57 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
     roteiro_tec_pronto = distribuir(roteiro_tec, equipes_tec)
     df_final = pd.concat([roteiro_zel_pronto, roteiro_tec_pronto], ignore_index=True)
 
-    # --- 6. AGENDAMENTO ---
+    # 6. AGENDAMENTO - ORDEM CONTÍNUA (ALTERADO AQUI)
     hoje = datetime.now()
     dias_uteis = pd.date_range(start=hoje.replace(day=1), end=(hoje.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1), freq='B')
     df_cal = pd.DataFrame({'Data': dias_uteis, 'Semana': dias_uteis.isocalendar().week})
     
     def agendar(grupo):
         prod = 2 
-        datas, semanas = [], []
+        datas, semanas, ordens = [], [], []
         dia_idx, cont = 0, 0
-        for _ in range(len(grupo)):
+        
+        # Iteração com índice para contagem global da equipe
+        for i in range(len(grupo)):
             if dia_idx < len(df_cal):
                 datas.append(df_cal.iloc[dia_idx]['Data'])
                 semanas.append(df_cal.iloc[dia_idx]['Semana'])
             else:
                 datas.append(df_cal.iloc[-1]['Data'])
                 semanas.append(df_cal.iloc[-1]['Semana'])
+            
+            # ORDEM CONTÍNUA: Usa o contador geral (i + 1) em vez do diário
+            ordens.append(f"{i + 1}ª Visita")
+
             cont += 1
             if cont >= prod:
                 dia_idx += 1
-                cont = 0
-        return pd.DataFrame({'Data_Programada': datas, 'Semana': semanas}, index=grupo.index)
+                cont = 0 
+        return pd.DataFrame({'Data_Programada': datas, 'Semana': semanas, 'Ordem': ordens}, index=grupo.index)
 
     df_final = df_final.sort_values('Equipe_ID')
     if not df_final.empty:
         agendamento = df_final.groupby('Equipe_ID', group_keys=False).apply(agendar)
         df_final['Data_Programada'] = pd.to_datetime(agendamento['Data_Programada']).dt.strftime('%d/%m/%Y')
         df_final['Semana'] = agendamento['Semana']
+        df_final['Ordem_Visita'] = agendamento['Ordem']
     
-    # --- 7. GERAÇÃO DO RELATÓRIO DETALHADO (EXPLOSÃO DE LINHAS) ---
+    # 7. RELATÓRIO
     status_text.text("6/6: Gerando relatório detalhado e limpando caracteres...")
     
     linhas_detalhadas = []
     for _, row in df_final.iterrows():
         base = {
             'Data Programada': row['Data_Programada'],
+            'Ordem': row['Ordem_Visita'],
             'Semana': row['Semana'],
             'Sigla Site': row['sigla_site'],
-            'Endereço': row['Endereco_Limpo'],
+            'Endereco': row['Endereco_Limpo'],
             'CEP': row['CEP_Limpo'],
             'Latitude': row['latitude'],
             'Longitude': row['longitude'],
             'Equipe': row['Equipe_ID'],
-            'Técnico': row['Tecnico_Executante']
+            'Tecnico': row['Tecnico_Executante']
         }
         
         detalhe = row['Detalhe_Visita']
@@ -259,32 +264,30 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
         if 'DUPLA' in detalhe:
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Climatizacao'
-            r1['Execução'] = 'Dupla'
+            r1['Execucao'] = 'Dupla'
             linhas_detalhadas.append(r1)
             r2 = base.copy()
             r2['Tipo de Preventiva'] = 'Preventiva infra - Energia'
-            r2['Execução'] = 'Dupla'
+            r2['Execucao'] = 'Dupla'
             linhas_detalhadas.append(r2)
         elif 'SOLO (Clima)' in detalhe:
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Climatizacao'
-            r1['Execução'] = 'Único'
+            r1['Execucao'] = 'Unico'
             linhas_detalhadas.append(r1)
         elif 'SOLO (Energia)' in detalhe:
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Energia'
-            r1['Execução'] = 'Único'
+            r1['Execucao'] = 'Unico'
             linhas_detalhadas.append(r1)
         elif 'ZELADORIA' in detalhe:
             r1 = base.copy()
             r1['Tipo de Preventiva'] = 'Preventiva infra - Zeladoria'
-            r1['Execução'] = 'Único' 
+            r1['Execucao'] = 'Unico' 
             linhas_detalhadas.append(r1)
             
     df_export = pd.DataFrame(linhas_detalhadas)
     
-    # --- LIMPEZA DE ACENTOS (NORMALIZAÇÃO) ---
-    # Aplica a função remover_acentos em todas as células de texto
     cols_texto = df_export.select_dtypes(include=['object']).columns
     for col in cols_texto:
         df_export[col] = df_export[col].apply(remover_acentos)
@@ -301,13 +304,12 @@ if file_sites and file_prev and file_tec:
             if df_s is not None:
                 df_final, df_equipes_final, df_erros, df_export = processar_roteiro(df_s, df_p, df_t)
                 
-                # SALVA TUDO NA MEMÓRIA
                 st.session_state.df_final = df_final
                 st.session_state.df_export = df_export
                 st.session_state.df_equipes = df_equipes_final
                 st.session_state.df_erros = df_erros
                 st.session_state.dados_gerados = True
-                st.rerun() # Recarrega a página para mostrar os resultados
+                st.rerun()
             
         except Exception as e:
             st.error(f"Erro no processamento: {e}")
@@ -340,8 +342,7 @@ if st.session_state.dados_gerados:
         col2.metric("Equipes Ativas", len(df_equipes_final))
         st.dataframe(df_export.sort_values(by=['Data Programada', 'Equipe']))
         
-        # Download (Usando UTF-8-SIG para Excel abrir sem erros mesmo sem normalização, mas já normalizamos)
-        csv = df_export.to_csv(index=False, sep=';', decimal=',').encode('utf-8-sig')
+        csv = df_export.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
         st.download_button("📥 Baixar Planilha Final (CSV Excel)", data=csv, file_name='roteiro_detalhado.csv', mime='text/csv')
     
     st.subheader("🗺️ Mapa da Operação")

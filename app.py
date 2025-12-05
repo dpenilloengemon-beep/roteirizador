@@ -226,7 +226,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos):
                 semanas.append(df_cal.iloc[-1]['Semana'])
             
             # ORDEM CONTÍNUA: Usa o contador geral (i + 1) em vez do diário
-            ordens.append(f"{i + 1}ª Visita")
+            ordens.append(f"{i + 1} Visita")
 
             cont += 1
             if cont >= prod:

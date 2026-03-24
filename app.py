@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Roteirizador Técnica (Clima/Energia)", layout="wide")
 
 st.title("🚚 Roteirizador Especializado: Climatização & Energia")
+st.markdown("Foco: Apenas Preventivas de Clima e Energia | Sem Zeladoria/Gerador")
 
 # --- FUNÇÕES AUXILIARES ---
 def remover_acentos(texto):
@@ -25,6 +26,8 @@ def normalizar_texto(series):
 # --- INICIALIZAÇÃO DA MEMÓRIA ---
 if 'dados_gerados' not in st.session_state:
     st.session_state.dados_gerados = False
+if 'df_export' not in st.session_state:
+    st.session_state.df_export = pd.DataFrame()
 
 # --- BARRA LATERAL ---
 with st.sidebar:
@@ -55,14 +58,15 @@ with st.sidebar:
             equipes_fds = []
             if fds_opcao != "Não" and file_tec:
                 df_temp_tec = pd.read_excel(file_tec)
-                lista_equipes = sorted(df_temp_tec['equipe'].unique().astype(str).tolist())
-                equipes_fds = st.multiselect("Equipes autorizadas para FDS:", lista_equipes)
+                if 'equipe' in df_temp_tec.columns:
+                    lista_equipes = sorted(df_temp_tec['equipe'].unique().astype(str).tolist())
+                    equipes_fds = st.multiselect("Equipes autorizadas para FDS:", lista_equipes)
 
         except Exception as e:
-            st.error(f"Erro na leitura: {e}")
+            st.error(f"Erro na leitura dos filtros: {e}")
 
-    if st.button("🧹 Limpar Tudo"):
-        for key in st.session_state.keys(): del st.session_state[key]
+    if st.button("清理 🧹 Limpar Tudo"):
+        for key in list(st.session_state.keys()): del st.session_state[key]
         st.rerun()
 
 # --- LÓGICA DE PROCESSAMENTO ---
@@ -83,11 +87,14 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
         df_sites[col] = pd.to_numeric(df_sites[col].astype(str).str.replace(',', '.', regex=False), errors='coerce')
     df_sites = df_sites.dropna(subset=['latitude', 'longitude'])
 
-    # 2. EQUIPES (Focando em Clima e Energia)
-    status_text.text("2/6: Mapeando técnicos técnicos...")
+    # 2. EQUIPES (Tratamento robusto para evitar AttributeError)
+    status_text.text("2/6: Mapeando técnicos...")
     df_tecnicos['area'] = normalizar_texto(df_tecnicos.get('area', 'INDEFINIDO'))
-    
+    for col in ['latitude', 'longitude']:
+        df_tecnicos[col] = pd.to_numeric(df_tecnicos[col].astype(str).str.replace(',', '.', regex=False), errors='coerce')
+
     def mapear_integrantes(subdf):
+        # subdf aqui é garantido como DataFrame pelo groupby
         mapa = {}
         for _, row in subdf.iterrows():
             skill = str(row['tipo_preventiva'])
@@ -97,19 +104,21 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
         return pd.Series({
             'Integrantes_Lista': ' & '.join(subdf['nome_tecnico'].unique().astype(str)),
             'Mapa_Skills': mapa,
-            'latitude': pd.to_numeric(subdf['latitude'], errors='coerce').mean(),
-            'longitude': pd.to_numeric(subdf['longitude'], errors='coerce').mean(),
-            'area': subdf['area'].iloc[0]
+            'lat_media': subdf['latitude'].mean(),
+            'lon_media': subdf['longitude'].mean(),
+            'area_eq': subdf['area'].iloc[0]
         })
 
-    df_equipes = df_tecnicos.groupby('equipe').apply(mapear_integrantes).reset_index()
+    # reset_index garante que 'equipe' volte a ser coluna
+    df_equipes = df_tecnicos.groupby('equipe', group_keys=False).apply(mapear_integrantes).reset_index()
+    df_equipes = df_equipes.dropna(subset=['lat_media', 'lon_media'])
 
-    # 3. FILTRAGEM E TAREFAS (Remove Zeladoria e Gerador)
+    # 3. FILTRAGEM (Remove Zeladoria e Gerador)
     status_text.text("3/6: Filtrando Climatização e Energia...")
-    # Filtro rigoroso: apenas Climatizacao e Energia
-    mask_tecnica = df_prev['tipo_preventiva'].str.contains('Climatizacao|Energia', case=False, na=False)
-    mask_gerador = df_prev['tipo_preventiva'].str.contains('Gerador', case=False, na=False)
-    df_prev = df_prev[mask_tecnica & ~mask_gerador].copy()
+    df_prev = df_prev[
+        df_prev['tipo_preventiva'].str.contains('Climatizacao|Energia', case=False, na=False) & 
+        ~df_prev['tipo_preventiva'].str.contains('Gerador', case=False, na=False)
+    ].copy()
     
     def classificar_v(lista):
         txt = ", ".join(lista)
@@ -130,7 +139,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     if infra_prioritaria != "Nenhuma":
         df_roteiro['Score_Final'] += np.where(df_roteiro['tipo_infra'] == infra_prioritaria, 0, 10)
 
-    # 5. DISTRIBUIÇÃO POR ÁREA E PROXIMIDADE
+    # 5. DISTRIBUIÇÃO GEOGRÁFICA
     status_text.text("5/6: Calculando rotas por área...")
     
     def core_distribuir(tarefas_local, eqs_local):
@@ -140,19 +149,22 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             return tarefas_local
         
         sites_por_eq = math.ceil(len(tarefas_local) / len(eqs_local))
-        matriz = cdist(tarefas_local[['latitude', 'longitude']].values, eqs_local[['latitude', 'longitude']].values, metric='euclidean')
+        matriz = cdist(tarefas_local[['latitude', 'longitude']].values, eqs_local[['lat_media', 'lon_media']].values, metric='euclidean')
         ocupacao = np.zeros(len(eqs_local))
         designacao = []
+        
         for i in range(len(tarefas_local)):
             idx_eq = np.argsort(matriz[i])
+            escolhido = -1
             for eq_i in idx_eq:
                 if ocupacao[eq_i] < sites_por_eq:
-                    designacao.append(eq_i)
-                    ocupacao[eq_i] += 1
+                    escolhido = eq_i
                     break
+            if escolhido == -1: escolhido = idx_eq[0] # Fallback
+            designacao.append(escolhido)
+            ocupacao[escolhido] += 1
         
         tarefas_local['Equipe_ID'] = [eqs_local.iloc[d]['equipe'] for d in designacao]
-        # Lógica para pegar o nome do técnico específico se for visita SOLO
         executantes = []
         for idx, d in enumerate(designacao):
             eq_d = eqs_local.iloc[d]
@@ -160,25 +172,25 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             if "SOLO (Clima)" in v_tipo: executantes.append(eq_d['Mapa_Skills'].get('CLIMA', eq_d['Integrantes_Lista']))
             elif "SOLO (Energia)" in v_tipo: executantes.append(eq_d['Mapa_Skills'].get('ENERGIA', eq_d['Integrantes_Lista']))
             else: executantes.append(eq_d['Integrantes_Lista'])
-        
         tarefas_local['Tecnico_Executante'] = executantes
         return tarefas_local
 
     lista_final = []
     for area in df_roteiro['area'].unique():
         sub_t = df_roteiro[df_roteiro['area'] == area].copy().sort_values('Score_Final')
-        sub_e = df_equipes[df_equipes['area'] == area].copy()
+        sub_e = df_equipes[df_equipes['area_eq'] == area].copy()
         if not sub_t.empty:
             lista_final.append(core_distribuir(sub_t, sub_e))
     
+    if not lista_final: return pd.DataFrame()
     df_final = pd.concat(lista_final)
 
-    # 6. AGENDAMENTO DINÂMICO (Com FDS)
-    status_text.text("6/6: Gerando datas de programação...")
+    # 6. AGENDAMENTO DINÂMICO
+    status_text.text("6/6: Gerando datas...")
     
     def gerar_dias(id_eq):
         base_dias = pd.date_range(d_inicio, d_fim)
-        permitidos = [0, 1, 2, 3, 4] # Segunda a Sexta
+        permitidos = [0, 1, 2, 3, 4] # Seg-Sex
         if str(id_eq) in [str(e) for e in eqs_fds]:
             if fds_opt == "Apenas Sábado": permitidos.append(5)
             elif fds_opt == "Sábado e Domingo": permitidos.extend([5, 6])
@@ -187,14 +199,13 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     def aplicar_agenda(grupo):
         id_eq = grupo['Equipe_ID'].iloc[0]
         dias = gerar_dias(id_eq)
-        if not dias: return grupo # Evita erro se período for vazio
+        if not dias: dias = [d_inicio] # Fallback
         
         prod, dia_idx, cont = 2, 0, 0
         datas, ordens = [], []
         for i in range(len(grupo)):
             if dia_idx >= len(dias): datas.append(dias[-1])
             else: datas.append(dias[dia_idx])
-            
             ordens.append(f"{cont+1}ª Visita")
             cont += 1
             if cont >= prod:
@@ -208,13 +219,9 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     
     # Exportação formatada
     df_final = df_final.rename(columns={
-        'tipo_site': 'Prioridade', 
-        'tipo_infra': 'Infraestrutura', 
-        'area': 'Area', 
-        'sigla_site': 'Sigla Site', 
-        'ENDEREÇO + CEP': 'Endereco', 
-        'Equipe_ID': 'Equipe', 
-        'Tecnico_Executante': 'Tecnico'
+        'tipo_site': 'Prioridade', 'tipo_infra': 'Infraestrutura', 'area': 'Area', 
+        'sigla_site': 'Sigla Site', 'ENDEREÇO + CEP': 'Endereco', 
+        'Equipe_ID': 'Equipe', 'Tecnico_Executante': 'Tecnico'
     })
     
     cols_out = ['Data Programada', 'Ordem', 'Prioridade', 'Infraestrutura', 'Area', 'Sigla Site', 'Endereco', 'Equipe', 'Tecnico', 'Detalhe_Visita']
@@ -229,16 +236,19 @@ if file_sites and file_prev and file_tec:
             df_t = pd.read_excel(file_tec)
             
             res = processar_roteiro(df_s, df_p, df_t, infra_selecionada, data_inicio, data_fim, fds_opcao, equipes_fds)
-            st.session_state.df_export = res
-            st.session_state.dados_gerados = True
-            st.rerun()
+            
+            if res.empty:
+                st.warning("Nenhum dado encontrado com os filtros selecionados.")
+            else:
+                st.session_state.df_export = res
+                st.session_state.dados_gerados = True
+                st.rerun()
         except Exception as e:
             st.error(f"Erro no processamento: {e}")
 
 if st.session_state.dados_gerados:
-    st.success(f"Programação gerada com sucesso! ({len(st.session_state.df_export)} visitas)")
-    st.dataframe(st.session_state.df_export)
+    st.success(f"Programação gerada com sucesso! ({len(st.session_state.df_export)} sites)")
+    st.dataframe(st.session_state.df_export, use_container_width=True)
     
-    # Download
     csv = st.session_state.df_export.to_csv(index=False, sep=';').encode('utf-8')
     st.download_button("📥 Baixar Planilha (CSV)", csv, "roteiro_tecnico.csv", "text/csv")

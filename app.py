@@ -82,11 +82,10 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
         df_sites[col] = pd.to_numeric(df_sites[col].astype(str).str.replace(',', '.', regex=False), errors='coerce')
     df_sites = df_sites.dropna(subset=['latitude', 'longitude'])
 
-    # 2. EQUIPES (Proteção contra falta de Latitude/Longitude)
+    # 2. EQUIPES
     status_text.text("2/6: Mapeando técnicos...")
     df_tecnicos['area'] = normalizar_texto(df_tecnicos.get('area', 'INDEFINIDO'))
     
-    # Criar colunas lat/long caso não existam no Excel de técnicos
     if 'latitude' not in df_tecnicos.columns: df_tecnicos['latitude'] = np.nan
     if 'longitude' not in df_tecnicos.columns: df_tecnicos['longitude'] = np.nan
 
@@ -100,7 +99,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             if 'Climatizacao' in skill: mapa['CLIMA'] = row['nome_tecnico']
             elif 'Energia' in skill: mapa['ENERGIA'] = row['nome_tecnico']
         
-        # Se não houver coordenada, usa 0 (depois o sistema tentará associar pela Área)
         lat = subdf['latitude'].mean()
         lon = subdf['longitude'].mean()
         
@@ -114,7 +112,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
 
     df_equipes = df_tecnicos.groupby('equipe', group_keys=False).apply(mapear_integrantes).reset_index()
 
-    # 3. FILTRAGEM (Clima e Energia apenas)
+    # 3. FILTRAGEM
     status_text.text("3/6: Filtrando atividades...")
     df_prev = df_prev[
         df_prev['tipo_preventiva'].str.contains('Climatizacao|Energia', case=False, na=False) & 
@@ -132,13 +130,28 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     # 4. CRUZAMENTO
     status_text.text("4/6: Aplicando scores...")
     cols_ids = [c for c in ['ID_EBT', 'ID_CLARO_FIXO', 'ID_NET', 'ID_CLARO_OMR'] if c in df_sites.columns]
-    df_sites_long = df_sites.melt(id_vars=['latitude', 'longitude', 'area', 'tipo_site', 'tipo_infra', 'ENDEREÇO + CEP'], value_vars=cols_ids, value_name='ID_Unico').dropna(subset=['ID_Unico'])
-    df_roteiro = pd.merge(df_sites_long, df_missoes, left_on='ID_Unico', right_on='sigla_site', how='inner').drop_duplicates(subset=['sigla_site'])
+    df_sites_long = df_sites.melt(
+        id_vars=['latitude', 'longitude', 'area', 'tipo_site', 'tipo_infra', 'ENDEREÇO + CEP'],
+        value_vars=cols_ids,
+        value_name='ID_Unico'
+    ).dropna(subset=['ID_Unico'])
+
+    df_roteiro = pd.merge(
+        df_sites_long, df_missoes,
+        left_on='ID_Unico',
+        right_on='sigla_site',
+        how='inner'
+    ).drop_duplicates(subset=['sigla_site'])
 
     mapa_prioridade = {'CONCENTRADOR': 1, 'ESTRATEGICO': 2, 'PONTA': 3}
-    df_roteiro['Score_Final'] = df_roteiro['tipo_site'].apply(lambda x: next((v for k, v in mapa_prioridade.items() if k in str(x)), 3))
+    df_roteiro['Score_Final'] = df_roteiro['tipo_site'].apply(
+        lambda x: next((v for k, v in mapa_prioridade.items() if k in str(x)), 3)
+    )
+
     if infra_prioritaria != "Nenhuma":
-        df_roteiro['Score_Final'] += np.where(df_roteiro['tipo_infra'] == infra_prioritaria, 0, 10)
+        df_roteiro['Score_Final'] += np.where(
+            df_roteiro['tipo_infra'] == infra_prioritaria, 0, 10
+        )
 
     # 5. DISTRIBUIÇÃO
     status_text.text("5/6: Calculando rotas...")
@@ -150,13 +163,17 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             return tarefas_local
         
         sites_por_eq = math.ceil(len(tarefas_local) / len(eqs_local))
-        # Se as equipes não tiverem lat/long, distribuímos por ordem de prioridade apenas
+
         if (eqs_local['lat_media'] == 0).all():
             designacao = [i % len(eqs_local) for i in range(len(tarefas_local))]
         else:
-            matriz = cdist(tarefas_local[['latitude', 'longitude']].values, eqs_local[['lat_media', 'lon_media']].values, metric='euclidean')
+            matriz = cdist(
+                tarefas_local[['latitude', 'longitude']].values,
+                eqs_local[['lat_media', 'lon_media']].values
+            )
             ocupacao = np.zeros(len(eqs_local))
             designacao = []
+
             for i in range(len(tarefas_local)):
                 idx_eq = np.argsort(matriz[i])
                 escolhido = idx_eq[0]
@@ -166,15 +183,21 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
                         break
                 designacao.append(escolhido)
                 ocupacao[escolhido] += 1
-        
+
         tarefas_local['Equipe_ID'] = [eqs_local.iloc[d]['equipe'] for d in designacao]
+
         executantes = []
         for idx, d in enumerate(designacao):
             eq_d = eqs_local.iloc[d]
             v_tipo = tarefas_local.iloc[idx]['Detalhe_Visita']
-            if "SOLO (Clima)" in v_tipo: executantes.append(eq_d['Mapa_Skills'].get('CLIMA', eq_d['Integrantes_Lista']))
-            elif "SOLO (Energia)" in v_tipo: executantes.append(eq_d['Mapa_Skills'].get('ENERGIA', eq_d['Integrantes_Lista']))
-            else: executantes.append(eq_d['Integrantes_Lista'])
+
+            if "SOLO (Clima)" in v_tipo:
+                executantes.append(eq_d['Mapa_Skills'].get('CLIMA', eq_d['Integrantes_Lista']))
+            elif "SOLO (Energia)" in v_tipo:
+                executantes.append(eq_d['Mapa_Skills'].get('ENERGIA', eq_d['Integrantes_Lista']))
+            else:
+                executantes.append(eq_d['Integrantes_Lista'])
+
         tarefas_local['Tecnico_Executante'] = executantes
         return tarefas_local
 
@@ -186,58 +209,103 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     
     df_final = pd.concat(lista_final)
 
-    # 6. AGENDAMENTO
+    # 6. AGENDAMENTO CORRIGIDO (SEM PICOS)
     status_text.text("6/6: Gerando datas...")
-    
+
     def gerar_dias(id_eq):
         base_dias = pd.date_range(d_inicio, d_fim)
         permitidos = [0, 1, 2, 3, 4]
+
         if str(id_eq) in [str(e) for e in eqs_fds]:
-            if fds_opt == "Apenas Sábado": permitidos.append(5)
-            elif fds_opt == "Sábado e Domingo": permitidos.extend([5, 6])
+            if fds_opt == "Apenas Sábado":
+                permitidos.append(5)
+            elif fds_opt == "Sábado e Domingo":
+                permitidos.extend([5, 6])
+
         return [d for d in base_dias if d.weekday() in permitidos]
 
     def aplicar_agenda(grupo):
         id_eq = grupo['Equipe_ID'].iloc[0]
         dias = gerar_dias(id_eq)
-        if not dias: dias = [d_inicio]
-        prod, dia_idx, cont = 2, 0, 0
-        datas, ordens = [], []
-        for i in range(len(grupo)):
-            if dia_idx >= len(dias): datas.append(dias[-1])
-            else: datas.append(dias[dia_idx])
-            ordens.append(f"{cont+1}ª Visita")
-            cont += 1
-            if cont >= prod: dia_idx += 1; cont = 0
+
+        if not dias:
+            dias = [d_inicio]
+
+        total_visitas = len(grupo)
+        total_dias = len(dias)
+
+        base = total_visitas // total_dias
+        sobra = total_visitas % total_dias
+
+        visitas_por_dia = [base + (1 if i < sobra else 0) for i in range(total_dias)]
+
+        datas = []
+        ordens = []
+
+        dia_idx = 0
+        cont_no_dia = 0
+
+        for i in range(total_visitas):
+            datas.append(dias[dia_idx])
+            ordens.append(f"{cont_no_dia+1}ª Visita")
+
+            cont_no_dia += 1
+
+            if cont_no_dia >= visitas_por_dia[dia_idx]:
+                dia_idx += 1
+                cont_no_dia = 0
+
         grupo['Data Programada'] = [d.strftime('%d/%m/%Y') for d in datas]
         grupo['Ordem'] = ordens
+
         return grupo
 
     df_final = df_final.groupby('Equipe_ID', group_keys=False).apply(aplicar_agenda)
-    
+
     df_final = df_final.rename(columns={
-        'tipo_site': 'Prioridade', 'tipo_infra': 'Infraestrutura', 'area': 'Area', 
-        'sigla_site': 'Sigla Site', 'ENDEREÇO + CEP': 'Endereco', 
-        'Equipe_ID': 'Equipe', 'Tecnico_Executante': 'Tecnico'
+        'tipo_site': 'Prioridade',
+        'tipo_infra': 'Infraestrutura',
+        'area': 'Area',
+        'sigla_site': 'Sigla Site',
+        'ENDEREÇO + CEP': 'Endereco',
+        'Equipe_ID': 'Equipe',
+        'Tecnico_Executante': 'Tecnico'
     })
-    
-    cols_out = ['Data Programada', 'Ordem', 'Prioridade', 'Infraestrutura', 'Area', 'Sigla Site', 'Endereco', 'Equipe', 'Tecnico', 'Detalhe_Visita']
+
+    cols_out = [
+        'Data Programada', 'Ordem', 'Prioridade', 'Infraestrutura',
+        'Area', 'Sigla Site', 'Endereco', 'Equipe', 'Tecnico', 'Detalhe_Visita'
+    ]
+
     return df_final[cols_out]
 
 # --- EXECUÇÃO ---
 if file_sites and file_prev and file_tec:
     if st.button("🚀 Gerar Programação"):
         try:
-            df_s = pd.read_excel(file_sites); df_p = pd.read_excel(file_prev); df_t = pd.read_excel(file_tec)
-            res = processar_roteiro(df_s, df_p, df_t, infra_selecionada, data_inicio, data_fim, fds_opcao, equipes_fds)
+            df_s = pd.read_excel(file_sites)
+            df_p = pd.read_excel(file_prev)
+            df_t = pd.read_excel(file_tec)
+
+            res = processar_roteiro(
+                df_s, df_p, df_t,
+                infra_selecionada,
+                data_inicio,
+                data_fim,
+                fds_opcao,
+                equipes_fds
+            )
+
             st.session_state.df_export = res
             st.session_state.dados_gerados = True
             st.rerun()
+
         except Exception as e:
             st.error(f"Erro: {e}")
 
 if st.session_state.dados_gerados:
     st.success("Roteiro Gerado!")
     st.dataframe(st.session_state.df_export, use_container_width=True)
+
     csv = st.session_state.df_export.to_csv(index=False, sep=';').encode('utf-8')
     st.download_button("📥 Baixar Planilha", csv, "roteiro.csv", "text/csv")

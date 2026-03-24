@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Roteirizador Técnica (Clima/Energia)", layout="wide")
 
 st.title("🚚 Roteirizador Especializado: Climatização & Energia")
-st.markdown("Foco: Apenas Preventivas de Clima e Energia | Sem Zeladoria/Gerador")
+st.markdown("Programação/Planejamento Preventivas Rede Móvel")
 
 # --- FUNÇÕES AUXILIARES ---
 def remover_acentos(texto):

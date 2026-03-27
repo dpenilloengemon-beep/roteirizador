@@ -9,7 +9,7 @@ st.set_page_config(
 
 # Cabeçalho
 st.title("🗺️ Portal Central de Roteirização")
-st.markdown("Bem-vindo(a) ao sistema inteligente de planejamento de rotas e equipes.")
+st.markdown("Bem-vindo(a) ao sistema inteligente de planejamento de rotas e equipes para Preventivas.")
 
 st.divider()
 
@@ -39,4 +39,5 @@ with col2:
 st.divider()
 
 # Rodapé
-st.caption("Desenvolvido para otimização de rotas e gestão inteligente de equipes.")
+st.caption("Desenvolvido para otimização de rotas e gestão inteligente de equipes."
+          "by: Damares Penillo")

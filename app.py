@@ -40,4 +40,4 @@ st.divider()
 
 # Rodapé
 st.caption("Desenvolvido para otimização de rotas e gestão inteligente de equipes."
-          "by: Damares Penillo")
+          " by: Damares Penillo")

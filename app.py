@@ -31,7 +31,6 @@ with st.sidebar:
     df_tecnicos_dinamico = None
     equipes_fds = []
     
-    # REZRA 03: CAPACIDADE E OPÇÃO DE DIGITAR
     st.divider()
     st.subheader("⚙️ Capacidade Operacional")
     opcao_cap = st.radio(
@@ -49,6 +48,9 @@ with st.sidebar:
                 df_temp_sites = pd.read_csv(file_sites)
             else:
                 df_temp_sites = pd.read_excel(file_sites)
+            
+            # Tratamento contra colunas duplicadas no arquivo do usuário
+            df_temp_sites = df_temp_sites.loc[:, ~df_temp_sites.columns.duplicated()]
                 
             if 'area' not in df_temp_sites.columns:
                 df_temp_sites['area'] = 'INDEFINIDO'
@@ -111,6 +113,9 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
 
     # 1. PADRONIZAÇÃO SITES
     status_text.text("1/6: Preparando dados dos sites...")
+    df_sites = df_sites.loc[:, ~df_sites.columns.duplicated()].copy()
+    df_prev = df_prev.loc[:, ~df_prev.columns.duplicated()].copy()
+
     for col, default in {'area': 'INDEFINIDO', 'tipo_site': 'PONTA', 'tipo_infra': 'OUTROS'}.items():
         if col not in df_sites.columns: df_sites[col] = default
     
@@ -141,8 +146,8 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     # 3. FILTRAGEM
     status_text.text("3/6: Filtrando atividades...")
     df_prev = df_prev[
-        df_prev['tipo_preventiva'].str.contains('Climatizacao|Energia', case=False, na=False) & 
-        ~df_prev['tipo_preventiva'].str.contains('Gerador|Zeladoria', case=False, na=False)
+        df_prev['tipo_preventiva'].astype(str).str.contains('Climatizacao|Energia', case=False, na=False) & 
+        ~df_prev['tipo_preventiva'].astype(str).str.contains('Gerador|Zeladoria', case=False, na=False)
     ].copy()
     
     def classificar_v(lista):
@@ -172,7 +177,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     )
 
     if infra_prioritaria != "Nenhuma":
-        df_roteiro['Score_Final'] += np.where(df_roteiro['tipo_infra'] == infra_prioritaria, 0, 10)
+        df_roteiro['Score_Final'] += np.where(df_roteiro['tipo_infra'].astype(str) == infra_prioritaria, 0, 10)
 
     # 5. DISTRIBUIÇÃO P/ EQUIPES
     status_text.text("5/6: Calculando rotas...")
@@ -183,7 +188,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             tarefas_local['Tecnico_Executante'] = '-'
             return tarefas_local
         
-        # Como as equipes são dinâmicas sem lat/long, distribui em "round robin" balanceado
         designacao = [i % len(eqs_local) for i in range(len(tarefas_local))]
         tarefas_local['Equipe_ID'] = [eqs_local.iloc[d]['equipe'] for d in designacao]
         tarefas_local['Tecnico_Executante'] = [eqs_local.iloc[d]['Integrantes_Lista'] for d in designacao]
@@ -197,30 +201,25 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
     
     df_final = pd.concat(lista_final)
 
-    # 6. AGENDAMENTO INTELIGENTE (COM NOVAS REGRAS)
+    # 6. AGENDAMENTO INTELIGENTE (COM NOVAS REGRAS E TRAVAS ANTI-ERRO)
     status_text.text("6/6: Aplicando Regras de Capacidade e Datas...")
 
-    # REGRA 03: Definir peso da visita (Dupla consome 2 slots de capacidade)
     df_final['Peso_Slots'] = df_final['Detalhe_Visita'].apply(lambda x: 2 if "DUPLA" in x else 1)
 
     def aplicar_agenda_capacidade(grupo):
         id_eq = grupo['Equipe_ID'].iloc[0]
         base_dias = pd.date_range(d_inicio, d_fim)
         
-        # Dias de trabalho base da equipe
-        permitidos_eq = [0, 1, 2, 3, 4] # Seg a Sex
+        permitidos_eq = [0, 1, 2, 3, 4] 
         if str(id_eq) in [str(e) for e in eqs_fds]:
             if fds_opt == "Apenas Sábado": permitidos_eq.append(5)
             elif fds_opt == "Sábado e Domingo": permitidos_eq.extend([5, 6])
             
         dias_disponiveis = [d for d in base_dias if d.weekday() in permitidos_eq]
-        
-        # Dicionário para controlar a ocupação matemática diária da equipe (REGRA 04: Lotação máxima no início)
         ocupacao_dia = {d: 0 for d in dias_disponiveis}
         
-        # Ordenar grupo para garantir que o que tem mais restrição seja agendado primeiro onde cabe
-        # INDOOR precisa garantir os últimos dias.
-        grupo['Prioridade_Agendamento'] = np.where(grupo['tipo_infra'].str.contains('INDOOR'), 1, 2)
+        # Trava de segurança com astype(str) e na=False
+        grupo['Prioridade_Agendamento'] = np.where(grupo['tipo_infra'].astype(str).str.contains('INDOOR', case=False, na=False), 1, 2)
         grupo = grupo.sort_values(by=['Prioridade_Agendamento', 'Score_Final'])
 
         datas_prog = []
@@ -228,22 +227,22 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
 
         for idx, row in grupo.iterrows():
             peso = row['Peso_Slots']
-            infra = str(row['tipo_infra'])
             
-            # Filtro de dias possíveis para este site específico
+            # Trava para forçar leitura como Texto Limpo (mesmo se vier sujo do Excel)
+            infra_val = row.get('tipo_infra', '')
+            if isinstance(infra_val, pd.Series): 
+                infra_val = infra_val.iloc[0]
+            infra = str(infra_val).upper()
+            
             dias_site_permitidos = dias_disponiveis.copy()
             
-            # REGRA 01: ROOFTOP não pode FDS
             if 'ROOFTOP' in infra:
                 dias_site_permitidos = [d for d in dias_site_permitidos if d.weekday() < 5]
                 
-            # REGRA 02: INDOOR últimos 20 dias (Dia do mês >= 11)
             if 'INDOOR' in infra:
                 dias_site_permitidos = [d for d in dias_site_permitidos if d.day >= 11]
 
             alocado = False
-            
-            # REGRA 04: Percorre os dias permitidos do mais antigo pro mais novo (enche o começo do mês)
             for d in dias_site_permitidos:
                 if ocupacao_dia[d] + peso <= cap_dia:
                     datas_prog.append(d.strftime('%d/%m/%Y'))
@@ -252,7 +251,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
                     alocado = True
                     break
             
-            # Se varreu todos os dias possíveis e não tinha mais capacidade matemática
             if not alocado:
                 datas_prog.append("⚠️ Backlog (Sem Data)")
                 ordens.append("Extrapolou Capacidade")
@@ -303,7 +301,7 @@ if file_sites and file_prev:
                 data_fim,
                 fds_opcao,
                 equipes_fds,
-                cap_dia_input # Passando a capacidade selecionada pelo usuário
+                cap_dia_input 
             )
 
             st.session_state.df_export = res

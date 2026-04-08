@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 # =========================================================
 st.set_page_config(page_title="Roteirizador Móvel", layout="wide")
 st.title("📱 Roteirizador Móvel")
-st.caption("Roteirização com foco territorial: a equipe tenta permanecer o dia inteiro na mesma micro-região.")
+st.caption("Roteirização com foco territorial, limite de deslocamento e sequência otimizada por proximidade.")
 
 # =========================================================
 # FUNÇÕES AUXILIARES
@@ -51,6 +51,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 def tipo_site_rank(tipo_site):
     txt = normalizar_valor(tipo_site)
+
     if "CONCENTRADOR" in txt:
         return 1
     if "ESTRATEGICO" in txt or "ESTRATÉGICO" in txt:
@@ -105,21 +106,56 @@ def gerar_datas_disponiveis(data_inicio, data_fim, fds_opcao, equipe_nome, equip
 
     return [d for d in base_dias if d.weekday() in permitidos]
 
+def reordenar_rota_por_proximidade(df_bloco):
+    """
+    Reordena os sites do dia usando heurística do vizinho mais próximo.
+    """
+    if df_bloco.empty or len(df_bloco) <= 1:
+        return df_bloco.copy()
+
+    pendentes = df_bloco.copy()
+    resultado = []
+
+    # Começa pelo site mais prioritário / mais crítico
+    pendentes = pendentes.sort_values(
+        by=["Score_Final", "Prioridade_Agendamento", "Micro_Regiao", "Sigla Site"],
+        ascending=[True, True, True, True]
+    )
+    atual = pendentes.iloc[0]
+    resultado.append(atual)
+    pendentes = pendentes.drop(index=atual.name)
+
+    while not pendentes.empty:
+        lat_a = float(atual["latitude"])
+        lon_a = float(atual["longitude"])
+
+        pendentes = pendentes.copy()
+        pendentes["dist_tmp"] = haversine_km(
+            pendentes["latitude"].astype(float).values,
+            pendentes["longitude"].astype(float).values,
+            lat_a,
+            lon_a
+        )
+
+        pendentes = pendentes.sort_values(
+            by=["dist_tmp", "Score_Final", "Prioridade_Agendamento"],
+            ascending=[True, True, True]
+        )
+
+        atual = pendentes.iloc[0]
+        resultado.append(atual)
+        pendentes = pendentes.drop(index=atual.name)
+
+    df_result = pd.DataFrame(resultado).drop(columns=["dist_tmp"], errors="ignore")
+    return df_result.reset_index(drop=True)
+
 def calcular_distancia_sequencial(df, cap_dia):
-    """
-    Calcula:
-    - sequência de atendimento
-    - site anterior
-    - km do site anterior até o atual
-    - km acumulado no dia
-    - ordem com capacidade consumida progressiva
-    """
     if df.empty:
         return df.copy()
 
     df = df.copy()
-    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
-    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce").round(6)
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce").round(6)
     df["Peso_Slots"] = pd.to_numeric(df["Peso_Slots"], errors="coerce").fillna(1)
 
     df = df.reset_index(drop=True)
@@ -128,17 +164,9 @@ def calcular_distancia_sequencial(df, cap_dia):
         df.groupby(["Equipe", "Data Programada"]).cumcount() + 1
     )
 
-    df["Sigla Site Anterior"] = (
-        df.groupby(["Equipe", "Data Programada"])["Sigla Site"].shift(1)
-    )
-
-    df["Lat_Anterior"] = (
-        df.groupby(["Equipe", "Data Programada"])["latitude"].shift(1)
-    )
-
-    df["Lon_Anterior"] = (
-        df.groupby(["Equipe", "Data Programada"])["longitude"].shift(1)
-    )
+    df["Sigla Site Anterior"] = df.groupby(["Equipe", "Data Programada"])["Sigla Site"].shift(1)
+    df["Lat_Anterior"] = df.groupby(["Equipe", "Data Programada"])["latitude"].shift(1)
+    df["Lon_Anterior"] = df.groupby(["Equipe", "Data Programada"])["longitude"].shift(1)
 
     mascara = (
         df["latitude"].notna() &
@@ -148,7 +176,6 @@ def calcular_distancia_sequencial(df, cap_dia):
     )
 
     df["Km_Site_Anterior"] = 0.0
-
     df.loc[mascara, "Km_Site_Anterior"] = haversine_km(
         df.loc[mascara, "Lat_Anterior"].astype(float).values,
         df.loc[mascara, "Lon_Anterior"].astype(float).values,
@@ -157,7 +184,6 @@ def calcular_distancia_sequencial(df, cap_dia):
     )
 
     df["Km_Site_Anterior"] = df["Km_Site_Anterior"].round(2)
-
     df["Km_Acumulado_Dia"] = (
         df.groupby(["Equipe", "Data Programada"])["Km_Site_Anterior"]
         .cumsum()
@@ -178,7 +204,6 @@ def calcular_distancia_sequencial(df, cap_dia):
     )
 
     df = df.drop(columns=["Lat_Anterior", "Lon_Anterior"])
-
     return df
 
 # =========================================================
@@ -226,6 +251,31 @@ with st.sidebar:
         )
     else:
         cap_dia_input = 4
+
+    st.divider()
+    st.subheader("📍 Regras de Distância")
+
+    raio_micro_regiao_km = st.number_input(
+        "Raio ideal da mesma região (km)",
+        min_value=1,
+        max_value=50,
+        value=8,
+        key="raio_micro_km"
+    )
+
+    limite_max_entre_sites_km = st.number_input(
+        "Distância máxima entre sites no mesmo dia (km)",
+        min_value=1,
+        max_value=100,
+        value=15,
+        key="limite_site_km"
+    )
+
+    permitir_completar_longe = st.checkbox(
+        "Permitir completar capacidade com site longe",
+        value=False,
+        key="permitir_longe"
+    )
 
     if file_sites:
         try:
@@ -341,12 +391,10 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
 
     if "sigla_site" not in df_prev.columns:
         raise ValueError("A base de preventivas precisa ter a coluna 'sigla_site'.")
-
     if "tipo_preventiva" not in df_prev.columns:
         raise ValueError("A base de preventivas precisa ter a coluna 'tipo_preventiva'.")
 
     df_prev["sigla_site"] = df_prev["sigla_site"].astype(str).str.strip()
-
     df_prev = df_prev[
         df_prev["tipo_preventiva"].astype(str).str.contains("Climatizacao|Energia", case=False, na=False)
     ].copy()
@@ -354,11 +402,7 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     if df_prev.empty:
         raise ValueError("Nenhuma preventiva de Climatização/Energia encontrada na base.")
 
-    df_missoes = (
-        df_prev.groupby("sigla_site", as_index=False)
-        .agg({"tipo_preventiva": list})
-    )
-
+    df_missoes = df_prev.groupby("sigla_site", as_index=False).agg({"tipo_preventiva": list})
     df_missoes["Detalhe_Visita"] = df_missoes["tipo_preventiva"].apply(classificar_visita)
     df_missoes["Peso_Slots"] = df_missoes["Detalhe_Visita"].apply(peso_slots_visita)
 
@@ -388,6 +432,9 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     if df_roteiro.empty:
         raise ValueError("Nenhum site da base de sites cruzou com a base de preventivas.")
 
+    df_roteiro["latitude"] = pd.to_numeric(df_roteiro["latitude"], errors="coerce").round(6)
+    df_roteiro["longitude"] = pd.to_numeric(df_roteiro["longitude"], errors="coerce").round(6)
+
     df_roteiro["Rank_Tipo_Site"] = df_roteiro["tipo_site"].apply(tipo_site_rank)
 
     if infra_prioritaria != "Nenhuma":
@@ -401,7 +448,6 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
         df_roteiro["Penalidade_Infra"] = 0
 
     df_roteiro["Score_Final"] = df_roteiro["Rank_Tipo_Site"] + df_roteiro["Penalidade_Infra"]
-
     df_roteiro["Prioridade_Agendamento"] = np.where(
         df_roteiro["tipo_infra"].astype(str).str.contains("INDOOR", case=False, na=False),
         1,
@@ -409,7 +455,6 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     )
 
     df_roteiro["Micro_Regiao"] = criar_micro_regiao(df_roteiro, casas=2)
-
     return df_roteiro
 
 # =========================================================
@@ -462,7 +507,6 @@ def escolher_melhor_slot(task_row, slots_area):
         return None
 
     candidatos = slots_area.copy()
-
     candidatos = candidatos[
         candidatos["Capacidade_Usada"] + task_row["Peso_Slots"] <= candidatos["Capacidade_Total"]
     ].copy()
@@ -498,10 +542,9 @@ def escolher_melhor_slot(task_row, slots_area):
         by=["Mesmo_Micro", "Dist_Anchor", "Data", "Capacidade_Usada"],
         ascending=[False, True, True, True]
     )
-
     return candidatos.index[0]
 
-def preencher_mesma_regiao(tasks_pendentes, idx_task_ancora, slots_df, slot_idx):
+def preencher_mesma_regiao(tasks_pendentes, idx_task_ancora, slots_df, slot_idx, raio_micro_km, limite_max_km, permitir_longe):
     slot = slots_df.loc[slot_idx]
     capacidade_restante = int(slot["Capacidade_Total"] - slot["Capacidade_Usada"])
 
@@ -544,22 +587,40 @@ def preencher_mesma_regiao(tasks_pendentes, idx_task_ancora, slots_df, slot_idx)
         lon_anchor
     )
 
-    restantes = restantes.sort_values(
+    # Regra dura: prioriza mesma micro-região ou proximidade curta
+    preferenciais = restantes[
+        (restantes["Mesmo_Micro"] == 1) |
+        (restantes["Dist_Ancora"] <= float(raio_micro_km))
+    ].copy()
+
+    if preferenciais.empty and permitir_longe:
+        preferenciais = restantes[restantes["Dist_Ancora"] <= float(limite_max_km)].copy()
+
+    if preferenciais.empty:
+        return selecionados, slots_df
+
+    preferenciais = preferenciais.sort_values(
         by=["Mesmo_Micro", "Score_Final", "Prioridade_Agendamento", "Dist_Ancora"],
         ascending=[False, True, True, True]
     )
 
-    for idx, row in restantes.iterrows():
+    for idx, row in preferenciais.iterrows():
         peso = int(row["Peso_Slots"])
+        dist = float(row["Dist_Ancora"])
+
+        if not permitir_longe and dist > float(limite_max_km):
+            continue
+
         if peso <= capacidade_restante:
             selecionados.append(idx)
             capacidade_restante -= peso
+
         if capacidade_restante <= 0:
             break
 
     return selecionados, slots_df
 
-def roteirizar_area(tasks_area, slots_area):
+def roteirizar_area(tasks_area, slots_area, raio_micro_km, limite_max_km, permitir_longe):
     if tasks_area.empty:
         return pd.DataFrame(), slots_area, pd.DataFrame()
 
@@ -579,7 +640,15 @@ def roteirizar_area(tasks_area, slots_area):
         if slot_idx is None:
             break
 
-        selecionados, slots_area = preencher_mesma_regiao(tasks, idx_anchor, slots_area, slot_idx)
+        selecionados, slots_area = preencher_mesma_regiao(
+            tasks,
+            idx_anchor,
+            slots_area,
+            slot_idx,
+            raio_micro_km,
+            limite_max_km,
+            permitir_longe
+        )
 
         if not selecionados:
             tasks = tasks.drop(index=idx_anchor)
@@ -592,6 +661,17 @@ def roteirizar_area(tasks_area, slots_area):
         bloco["Tecnico"] = slot_info["Tecnico"]
         bloco["Data Programada"] = pd.to_datetime(slot_info["Data"]).strftime("%d/%m/%Y")
 
+        # Reordena a sequência interna do dia para minimizar deslocamento
+        bloco = bloco.rename(columns={
+            "sigla_site": "Sigla Site",
+            "tipo_site": "Prioridade",
+            "tipo_infra": "Infraestrutura",
+            "area": "Area",
+            "ENDEREÇO + CEP": "Endereco"
+        })
+
+        bloco = reordenar_rota_por_proximidade(bloco)
+
         peso_total = int(bloco["Peso_Slots"].sum())
         slots_area.at[slot_idx, "Capacidade_Usada"] = int(slots_area.at[slot_idx, "Capacidade_Usada"]) + peso_total
         slots_area.at[slot_idx, "Qtd_Tarefas"] = int(slots_area.at[slot_idx, "Qtd_Tarefas"]) + len(bloco)
@@ -600,9 +680,9 @@ def roteirizar_area(tasks_area, slots_area):
         tasks = tasks.drop(index=selecionados)
 
     if alocados:
-        df_ok = pd.concat(alocados, ignore_index=False).copy()
+        df_ok = pd.concat(alocados, ignore_index=True).copy()
     else:
-        df_ok = pd.DataFrame(columns=tasks_area.columns.tolist() + ["Equipe", "Tecnico", "Data Programada"])
+        df_ok = pd.DataFrame()
 
     backlog = tasks.copy()
     return df_ok, slots_area, backlog
@@ -610,7 +690,7 @@ def roteirizar_area(tasks_area, slots_area):
 # =========================================================
 # PROCESSAMENTO PRINCIPAL
 # =========================================================
-def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inicio, d_fim, fds_opt, eqs_fds, cap_dia):
+def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inicio, d_fim, fds_opt, eqs_fds, cap_dia, raio_micro_km, limite_max_km, permitir_longe):
     status_text = st.empty()
     bar = st.progress(0)
 
@@ -645,14 +725,27 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             lista_backlog.append(sem_eq)
             continue
 
-        ok_area, slots_area_atualizados, backlog_area = roteirizar_area(tasks_area, slots_area)
+        ok_area, slots_area_atualizados, backlog_area = roteirizar_area(
+            tasks_area,
+            slots_area,
+            raio_micro_km,
+            limite_max_km,
+            permitir_longe
+        )
+
         slots.loc[slots_area_atualizados.index, :] = slots_area_atualizados
 
         if not ok_area.empty:
             lista_ok.append(ok_area)
 
         if not backlog_area.empty:
-            backlog_area = backlog_area.copy()
+            backlog_area = backlog_area.copy().rename(columns={
+                "sigla_site": "Sigla Site",
+                "tipo_site": "Prioridade",
+                "tipo_infra": "Infraestrutura",
+                "area": "Area",
+                "ENDEREÇO + CEP": "Endereco"
+            })
             backlog_area["Equipe"] = "⚠️ Backlog"
             backlog_area["Tecnico"] = "-"
             backlog_area["Data Programada"] = "⚠️ Backlog (Sem Data)"
@@ -672,14 +765,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
         df_backlog = pd.DataFrame()
 
     if not df_final.empty:
-        df_final = df_final.rename(columns={
-            "tipo_site": "Prioridade",
-            "tipo_infra": "Infraestrutura",
-            "area": "Area",
-            "sigla_site": "Sigla Site",
-            "ENDEREÇO + CEP": "Endereco"
-        })
-
         df_final = df_final.sort_values(
             by=["Data Programada", "Equipe", "Score_Final", "Micro_Regiao", "Sigla Site"],
             ascending=[True, True, True, True, True]
@@ -715,14 +800,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
         df_final = df_final[cols_ok]
 
     if not df_backlog.empty:
-        df_backlog = df_backlog.rename(columns={
-            "tipo_site": "Prioridade",
-            "tipo_infra": "Infraestrutura",
-            "area": "Area",
-            "sigla_site": "Sigla Site",
-            "ENDEREÇO + CEP": "Endereco"
-        })
-
         cols_backlog = [
             "Data Programada",
             "Prioridade",
@@ -770,15 +847,16 @@ if file_sites and file_prev:
                 data_fim,
                 fds_opcao,
                 equipes_fds,
-                cap_dia_input
+                cap_dia_input,
+                raio_micro_regiao_km,
+                limite_max_entre_sites_km,
+                permitir_completar_longe
             )
 
             if backlog.empty:
                 resultado_export = resultado.copy()
             else:
-                linha_sep = pd.DataFrame([{
-                    c: "" for c in set(resultado.columns).union(set(backlog.columns))
-                }])
+                linha_sep = pd.DataFrame([{c: "" for c in set(resultado.columns).union(set(backlog.columns))}])
                 primeira_col = list(linha_sep.columns)[0]
                 linha_sep.at[0, primeira_col] = "========== BACKLOG =========="
 

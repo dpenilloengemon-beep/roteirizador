@@ -57,6 +57,22 @@ def tipo_site_rank(tipo_site):
         return 2
     return 3
 
+def classificar_visita(lista_tipos):
+    txt = " | ".join([str(x) for x in lista_tipos]).upper()
+    tem_clima = "CLIMATIZ" in txt
+    tem_energia = "ENERGIA" in txt
+
+    if tem_clima and tem_energia:
+        return "DUPLA (Clima+Energia)"
+    if tem_clima:
+        return "SOLO (Clima)"
+    if tem_energia:
+        return "SOLO (Energia)"
+    return "NÃO CLASSIFICADA"
+
+def peso_slots_visita(detalhe):
+    return 2 if "DUPLA" in str(detalhe).upper() else 1
+
 def criar_micro_regiao(df, casas=2):
     lat_cell = df["latitude"].round(casas)
     lon_cell = df["longitude"].round(casas)
@@ -88,6 +104,82 @@ def gerar_datas_disponiveis(data_inicio, data_fim, fds_opcao, equipe_nome, equip
             permitidos.add(6)
 
     return [d for d in base_dias if d.weekday() in permitidos]
+
+def calcular_distancia_sequencial(df, cap_dia):
+    """
+    Calcula:
+    - sequência de atendimento
+    - site anterior
+    - km do site anterior até o atual
+    - km acumulado no dia
+    - ordem com capacidade consumida progressiva
+    """
+    if df.empty:
+        return df.copy()
+
+    df = df.copy()
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    df["Peso_Slots"] = pd.to_numeric(df["Peso_Slots"], errors="coerce").fillna(1)
+
+    df = df.reset_index(drop=True)
+
+    df["Sequencia_Atendimento"] = (
+        df.groupby(["Equipe", "Data Programada"]).cumcount() + 1
+    )
+
+    df["Sigla Site Anterior"] = (
+        df.groupby(["Equipe", "Data Programada"])["Sigla Site"].shift(1)
+    )
+
+    df["Lat_Anterior"] = (
+        df.groupby(["Equipe", "Data Programada"])["latitude"].shift(1)
+    )
+
+    df["Lon_Anterior"] = (
+        df.groupby(["Equipe", "Data Programada"])["longitude"].shift(1)
+    )
+
+    mascara = (
+        df["latitude"].notna() &
+        df["longitude"].notna() &
+        df["Lat_Anterior"].notna() &
+        df["Lon_Anterior"].notna()
+    )
+
+    df["Km_Site_Anterior"] = 0.0
+
+    df.loc[mascara, "Km_Site_Anterior"] = haversine_km(
+        df.loc[mascara, "Lat_Anterior"].astype(float).values,
+        df.loc[mascara, "Lon_Anterior"].astype(float).values,
+        df.loc[mascara, "latitude"].astype(float).values,
+        df.loc[mascara, "longitude"].astype(float).values
+    )
+
+    df["Km_Site_Anterior"] = df["Km_Site_Anterior"].round(2)
+
+    df["Km_Acumulado_Dia"] = (
+        df.groupby(["Equipe", "Data Programada"])["Km_Site_Anterior"]
+        .cumsum()
+        .round(2)
+    )
+
+    df["Sigla Site Anterior"] = df["Sigla Site Anterior"].fillna("INÍCIO DO DIA")
+
+    df["Capacidade_Consumida"] = (
+        df.groupby(["Equipe", "Data Programada"])["Peso_Slots"]
+        .cumsum()
+    )
+
+    df["Ordem"] = (
+        "Cap. consumida: "
+        + df["Capacidade_Consumida"].astype(int).astype(str)
+        + f"/{cap_dia}"
+    )
+
+    df = df.drop(columns=["Lat_Anterior", "Lon_Anterior"])
+
+    return df
 
 # =========================================================
 # ESTADO
@@ -250,7 +342,25 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     if "sigla_site" not in df_prev.columns:
         raise ValueError("A base de preventivas precisa ter a coluna 'sigla_site'.")
 
+    if "tipo_preventiva" not in df_prev.columns:
+        raise ValueError("A base de preventivas precisa ter a coluna 'tipo_preventiva'.")
+
     df_prev["sigla_site"] = df_prev["sigla_site"].astype(str).str.strip()
+
+    df_prev = df_prev[
+        df_prev["tipo_preventiva"].astype(str).str.contains("Climatizacao|Energia", case=False, na=False)
+    ].copy()
+
+    if df_prev.empty:
+        raise ValueError("Nenhuma preventiva de Climatização/Energia encontrada na base.")
+
+    df_missoes = (
+        df_prev.groupby("sigla_site", as_index=False)
+        .agg({"tipo_preventiva": list})
+    )
+
+    df_missoes["Detalhe_Visita"] = df_missoes["tipo_preventiva"].apply(classificar_visita)
+    df_missoes["Peso_Slots"] = df_missoes["Detalhe_Visita"].apply(peso_slots_visita)
 
     cols_ids = [c for c in ["ID_EBT", "ID_CLARO_FIXO", "ID_NET", "ID_CLARO_OMR"] if c in df_sites.columns]
     if not cols_ids:
@@ -269,7 +379,7 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
 
     df_roteiro = pd.merge(
         df_sites_long,
-        df_prev[["sigla_site"]].drop_duplicates(),
+        df_missoes[["sigla_site", "Detalhe_Visita", "Peso_Slots"]],
         left_on="ID_Unico",
         right_on="sigla_site",
         how="inner"
@@ -278,8 +388,6 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     if df_roteiro.empty:
         raise ValueError("Nenhum site da base de sites cruzou com a base de preventivas.")
 
-    df_roteiro["Peso_Slots"] = 1
-    df_roteiro["Detalhe_Visita"] = "Preventiva Móvel"
     df_roteiro["Rank_Tipo_Site"] = df_roteiro["tipo_site"].apply(tipo_site_rank)
 
     if infra_prioritaria != "Nenhuma":
@@ -293,11 +401,13 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
         df_roteiro["Penalidade_Infra"] = 0
 
     df_roteiro["Score_Final"] = df_roteiro["Rank_Tipo_Site"] + df_roteiro["Penalidade_Infra"]
+
     df_roteiro["Prioridade_Agendamento"] = np.where(
         df_roteiro["tipo_infra"].astype(str).str.contains("INDOOR", case=False, na=False),
         1,
         2
     )
+
     df_roteiro["Micro_Regiao"] = criar_micro_regiao(df_roteiro, casas=2)
 
     return df_roteiro
@@ -562,14 +672,6 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
         df_backlog = pd.DataFrame()
 
     if not df_final.empty:
-        consumo = (
-            df_final.groupby(["Equipe", "Data Programada"], as_index=False)
-            .agg(Capacidade_Consumida=("Peso_Slots", "sum"))
-        )
-
-        df_final = df_final.merge(consumo, on=["Equipe", "Data Programada"], how="left")
-        df_final["Ordem"] = "Cap. consumida: " + df_final["Capacidade_Consumida"].astype(str) + f"/{cap_dia}"
-
         df_final = df_final.rename(columns={
             "tipo_site": "Prioridade",
             "tipo_infra": "Infraestrutura",
@@ -578,19 +680,30 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             "ENDEREÇO + CEP": "Endereco"
         })
 
+        df_final = df_final.sort_values(
+            by=["Data Programada", "Equipe", "Score_Final", "Micro_Regiao", "Sigla Site"],
+            ascending=[True, True, True, True, True]
+        ).reset_index(drop=True)
+
+        df_final = calcular_distancia_sequencial(df_final, cap_dia)
+
         cols_ok = [
             "Data Programada",
+            "Sequencia_Atendimento",
             "Ordem",
             "Prioridade",
             "Infraestrutura",
             "Area",
             "Micro_Regiao",
+            "Sigla Site Anterior",
             "Sigla Site",
             "Endereco",
             "Equipe",
             "Tecnico",
             "Detalhe_Visita",
             "Peso_Slots",
+            "Km_Site_Anterior",
+            "Km_Acumulado_Dia",
             "latitude",
             "longitude"
         ]
@@ -599,10 +712,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             if c not in df_final.columns:
                 df_final[c] = ""
 
-        df_final = df_final[cols_ok].sort_values(
-            by=["Data Programada", "Equipe", "Prioridade", "Micro_Regiao", "Sigla Site"],
-            ascending=[True, True, True, True, True]
-        ).reset_index(drop=True)
+        df_final = df_final[cols_ok]
 
     if not df_backlog.empty:
         df_backlog = df_backlog.rename(columns={

@@ -6,8 +6,9 @@ from datetime import datetime, timedelta
 # =========================================================
 # CONFIGURAÇÃO DA PÁGINA
 # =========================================================
-st.set_page_config(page_title="Roteirizador Técnica (Clima/Energia)", layout="wide")
-st.title("🚚 Roteirizador Especializado: Climatização & Energia")
+st.set_page_config(page_title="Roteirizador Móvel", layout="wide")
+st.title("📱 Roteirizador Móvel")
+st.caption("Roteirização com foco territorial: a equipe tenta permanecer o dia inteiro na mesma micro-região.")
 
 # =========================================================
 # FUNÇÕES AUXILIARES
@@ -56,22 +57,6 @@ def tipo_site_rank(tipo_site):
         return 2
     return 3
 
-def classificar_visita(lista_tipos):
-    txt = " | ".join([str(x) for x in lista_tipos]).upper()
-    tem_clima = "CLIMATIZ" in txt
-    tem_energia = "ENERGIA" in txt
-
-    if tem_clima and tem_energia:
-        return "DUPLA (Clima+Energia)"
-    if tem_clima:
-        return "SOLO (Clima)"
-    if tem_energia:
-        return "SOLO (Energia)"
-    return "NÃO CLASSIFICADA"
-
-def peso_slots_visita(detalhe):
-    return 2 if "DUPLA" in str(detalhe).upper() else 1
-
 def criar_micro_regiao(df, casas=2):
     lat_cell = df["latitude"].round(casas)
     lon_cell = df["longitude"].round(casas)
@@ -107,24 +92,24 @@ def gerar_datas_disponiveis(data_inicio, data_fim, fds_opcao, equipe_nome, equip
 # =========================================================
 # ESTADO
 # =========================================================
-if "dados_gerados" not in st.session_state:
-    st.session_state.dados_gerados = False
-if "df_export" not in st.session_state:
-    st.session_state.df_export = pd.DataFrame()
-if "df_resultado" not in st.session_state:
-    st.session_state.df_resultado = pd.DataFrame()
-if "df_backlog" not in st.session_state:
-    st.session_state.df_backlog = pd.DataFrame()
-if "df_slots" not in st.session_state:
-    st.session_state.df_slots = pd.DataFrame()
+if "dados_gerados_movel" not in st.session_state:
+    st.session_state.dados_gerados_movel = False
+if "df_export_movel" not in st.session_state:
+    st.session_state.df_export_movel = pd.DataFrame()
+if "df_resultado_movel" not in st.session_state:
+    st.session_state.df_resultado_movel = pd.DataFrame()
+if "df_backlog_movel" not in st.session_state:
+    st.session_state.df_backlog_movel = pd.DataFrame()
+if "df_slots_movel" not in st.session_state:
+    st.session_state.df_slots_movel = pd.DataFrame()
 
 # =========================================================
 # SIDEBAR
 # =========================================================
 with st.sidebar:
     st.header("📂 Arquivos de Entrada")
-    file_sites = st.file_uploader("Base de Sites (sites.xlsx)", type=["xlsx", "csv"])
-    file_prev = st.file_uploader("Preventivas (preventivas.xlsx)", type=["xlsx", "csv"])
+    file_sites = st.file_uploader("Base de Sites", type=["xlsx", "csv"], key="sites_movel")
+    file_prev = st.file_uploader("Base de Preventivas", type=["xlsx", "csv"], key="prev_movel")
 
     infra_selecionada = "Nenhuma"
     df_tecnicos_dinamico = pd.DataFrame()
@@ -135,7 +120,8 @@ with st.sidebar:
 
     opcao_cap = st.radio(
         "Como deseja definir a capacidade diária?",
-        ["Capacidade Máxima Padrão (4/dia)", "Digitar capacidade diária"]
+        ["Capacidade Máxima Padrão (4/dia)", "Digitar capacidade diária"],
+        key="cap_movel"
     )
 
     if opcao_cap == "Digitar capacidade diária":
@@ -143,7 +129,8 @@ with st.sidebar:
             "Preventivas por Equipe/Dia",
             min_value=1,
             max_value=20,
-            value=4
+            value=4,
+            key="cap_dia_movel"
         )
     else:
         cap_dia_input = 4
@@ -176,7 +163,7 @@ with st.sidebar:
                         min_value=0,
                         max_value=50,
                         value=padrao,
-                        key=f"eq_{area}"
+                        key=f"eq_movel_{area}"
                     )
 
             dados_equipes = []
@@ -197,25 +184,38 @@ with st.sidebar:
                 )
                 st.divider()
                 st.subheader("🎯 Estratégia e Período")
-                infra_selecionada = st.selectbox("Priorizar Tipo de Infra?", ["Nenhuma"] + opcoes_infra)
+                infra_selecionada = st.selectbox(
+                    "Priorizar Tipo de Infra?",
+                    ["Nenhuma"] + opcoes_infra,
+                    key="infra_movel"
+                )
 
             hoje = datetime.now()
             col_d1, col_d2 = st.columns(2)
-            data_inicio = col_d1.date_input("Início da Prog.", hoje + timedelta(days=1))
-            data_fim = col_d2.date_input("Fim da Prog.", hoje + timedelta(days=15))
+            data_inicio = col_d1.date_input("Início da Prog.", hoje + timedelta(days=1), key="dt_ini_movel")
+            data_fim = col_d2.date_input("Fim da Prog.", hoje + timedelta(days=15), key="dt_fim_movel")
 
-            fds_opcao = st.radio("Programar Fins de Semana?", ["Não", "Apenas Sábado", "Sábado e Domingo"])
+            fds_opcao = st.radio(
+                "Programar Fins de Semana?",
+                ["Não", "Apenas Sábado", "Sábado e Domingo"],
+                key="fds_movel"
+            )
 
             if fds_opcao != "Não" and not df_tecnicos_dinamico.empty:
                 lista_equipes = sorted(df_tecnicos_dinamico["equipe"].astype(str).unique().tolist())
-                equipes_fds = st.multiselect("Equipes autorizadas para FDS:", lista_equipes)
+                equipes_fds = st.multiselect(
+                    "Equipes autorizadas para FDS:",
+                    lista_equipes,
+                    key="eq_fds_movel"
+                )
 
         except Exception as e:
             st.error(f"Erro nos filtros: {e}")
 
-    if st.button("Limpar Tudo 🧹"):
+    if st.button("Limpar Tudo 🧹", key="limpar_movel"):
         for key in list(st.session_state.keys()):
-            del st.session_state[key]
+            if "movel" in key:
+                del st.session_state[key]
         st.rerun()
 
 # =========================================================
@@ -247,20 +247,10 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
 
     df_sites = df_sites.dropna(subset=["latitude", "longitude"]).copy()
 
-    if "sigla_site" not in df_prev.columns or "tipo_preventiva" not in df_prev.columns:
-        raise ValueError("A base de preventivas precisa ter as colunas 'sigla_site' e 'tipo_preventiva'.")
+    if "sigla_site" not in df_prev.columns:
+        raise ValueError("A base de preventivas precisa ter a coluna 'sigla_site'.")
 
-    df_prev = df_prev[
-        df_prev["tipo_preventiva"].astype(str).str.contains("Climatizacao|Energia", case=False, na=False) &
-        ~df_prev["tipo_preventiva"].astype(str).str.contains("Gerador|Zeladoria", case=False, na=False)
-    ].copy()
-
-    if df_prev.empty:
-        raise ValueError("Nenhuma preventiva de Climatização/Energia encontrada após o filtro.")
-
-    df_missoes = df_prev.groupby("sigla_site").agg({"tipo_preventiva": list}).reset_index()
-    df_missoes["Detalhe_Visita"] = df_missoes["tipo_preventiva"].apply(classificar_visita)
-    df_missoes["Peso_Slots"] = df_missoes["Detalhe_Visita"].apply(peso_slots_visita)
+    df_prev["sigla_site"] = df_prev["sigla_site"].astype(str).str.strip()
 
     cols_ids = [c for c in ["ID_EBT", "ID_CLARO_FIXO", "ID_NET", "ID_CLARO_OMR"] if c in df_sites.columns]
     if not cols_ids:
@@ -276,11 +266,10 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     ).dropna(subset=["ID_Unico"]).copy()
 
     df_sites_long["ID_Unico"] = df_sites_long["ID_Unico"].astype(str).str.strip()
-    df_missoes["sigla_site"] = df_missoes["sigla_site"].astype(str).str.strip()
 
     df_roteiro = pd.merge(
         df_sites_long,
-        df_missoes,
+        df_prev[["sigla_site"]].drop_duplicates(),
         left_on="ID_Unico",
         right_on="sigla_site",
         how="inner"
@@ -289,6 +278,8 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     if df_roteiro.empty:
         raise ValueError("Nenhum site da base de sites cruzou com a base de preventivas.")
 
+    df_roteiro["Peso_Slots"] = 1
+    df_roteiro["Detalhe_Visita"] = "Preventiva Móvel"
     df_roteiro["Rank_Tipo_Site"] = df_roteiro["tipo_site"].apply(tipo_site_rank)
 
     if infra_prioritaria != "Nenhuma":
@@ -655,7 +646,7 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
 # EXECUÇÃO
 # =========================================================
 if file_sites and file_prev:
-    if st.button("🚀 Gerar Programação com Capacidade"):
+    if st.button("🚀 Gerar Programação com Capacidade", key="gerar_movel"):
         try:
             df_s = ler_arquivo(file_sites)
             df_p = ler_arquivo(file_prev)
@@ -687,11 +678,11 @@ if file_sites and file_prev:
                     sort=False
                 )
 
-            st.session_state.df_export = resultado_export
-            st.session_state.df_resultado = resultado
-            st.session_state.df_backlog = backlog
-            st.session_state.df_slots = resumo_slots
-            st.session_state.dados_gerados = True
+            st.session_state.df_export_movel = resultado_export
+            st.session_state.df_resultado_movel = resultado
+            st.session_state.df_backlog_movel = backlog
+            st.session_state.df_slots_movel = resumo_slots
+            st.session_state.dados_gerados_movel = True
             st.rerun()
 
         except Exception as e:
@@ -700,13 +691,38 @@ if file_sites and file_prev:
 # =========================================================
 # EXIBIÇÃO
 # =========================================================
-if st.session_state.dados_gerados:
+if st.session_state.dados_gerados_movel:
     st.success("Roteiro gerado com sucesso!")
 
     tab1, tab2, tab3 = st.tabs(["📋 Programação", "⚠️ Backlog", "📊 Resumo Equipes"])
 
     with tab1:
-        st.dataframe(st.session_state.df_resultado, use_container_width=True)
+        st.dataframe(st.session_state.df_resultado_movel, use_container_width=True)
 
     with tab2:
-        st.dataframe(st.session_state.df_backlog,
+        st.dataframe(st.session_state.df_backlog_movel, use_container_width=True)
+
+    with tab3:
+        df_slots = st.session_state.df_slots_movel.copy()
+        if not df_slots.empty:
+            resumo = (
+                df_slots.groupby(["Area", "Equipe", "Tecnico"], as_index=False)
+                .agg(
+                    Dias_Disponiveis=("Data", "count"),
+                    Capacidade_Total=("Capacidade_Total", "sum"),
+                    Capacidade_Usada=("Capacidade_Usada", "sum"),
+                    Dias_Com_Rota=("Qtd_Tarefas", lambda x: int((pd.Series(x) > 0).sum())),
+                    Qtd_Tarefas=("Qtd_Tarefas", "sum")
+                )
+            )
+            st.dataframe(resumo, use_container_width=True)
+        else:
+            st.info("Nenhum resumo disponível.")
+
+    csv = st.session_state.df_export_movel.to_csv(index=False, sep=";").encode("utf-8-sig")
+    st.download_button(
+        "📥 Baixar Planilha Final",
+        csv,
+        "roteiro_movel_planejado.csv",
+        "text/csv"
+    )

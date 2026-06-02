@@ -4,3 +4,4 @@ numpy
 geopy
 scipy
 openpyxl
+xlsxwriter

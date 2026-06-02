@@ -76,6 +76,80 @@ def classificar_visita(lista_tipos):
 def peso_slots_visita(detalhe):
     return 2 if "DUPLA" in str(detalhe).upper() else 1
 
+def remover_acentos(texto):
+    """Remove acentos para comparação de textos/colunas."""
+    if pd.isna(texto):
+        return ""
+    texto = str(texto)
+    texto = unicodedata.normalize("NFKD", texto)
+    return "".join(ch for ch in texto if not unicodedata.combining(ch))
+
+
+def chave_comparacao(texto):
+    """Normaliza texto removendo acento, espaço, ponto e caracteres especiais."""
+    texto = remover_acentos(texto).upper().strip()
+    return "".join(ch for ch in texto if ch.isalnum())
+
+
+def encontrar_coluna(df, nomes_possiveis):
+    """
+    Localiza uma coluna mesmo que ela esteja escrita com ponto, espaço ou acento.
+    Ex.: W.O, WO, W O, Ordem de Serviço, OS.
+    """
+    mapa_colunas = {chave_comparacao(col): col for col in df.columns}
+
+    for nome in nomes_possiveis:
+        chave = chave_comparacao(nome)
+        if chave in mapa_colunas:
+            return mapa_colunas[chave]
+
+    # Busca flexível para casos como "Nº W.O", "WO Clima", "Ordem Serviço Energia".
+    chaves_wo = {"WO", "WORKORDER", "ORDEMSERVICO", "ORDEMDE SERVICO", "ORDEMDESERVICO", "OS"}
+    for chave_col, col_original in mapa_colunas.items():
+        if "WO" in chave_col or "WORKORDER" in chave_col or "ORDEMSERVICO" in chave_col or "ORDEMDESERVICO" in chave_col:
+            return col_original
+        # Evita pegar qualquer coluna com "OS" no meio de outra palavra.
+        if chave_col == "OS" or chave_col.startswith("OS"):
+            return col_original
+
+    return None
+
+
+def classificar_tipo_wo(tipo_preventiva):
+    """Classifica a preventiva para separar a W.O em Climatização ou Energia Elétrica."""
+    txt = remover_acentos(tipo_preventiva).upper()
+
+    if "CLIMATIZ" in txt or "AR CONDICIONADO" in txt or "HVAC" in txt:
+        return "CLIMATIZACAO"
+
+    if "ENERGIA" in txt or "ELETRIC" in txt or "ELETRICA" in txt or "ELÉTRICA" in txt:
+        return "ENERGIA_ELETRICA"
+
+    return "OUTROS"
+
+
+def juntar_unicos_sem_vazio(valores):
+    """Junta W.O únicas do mesmo site/tipo, sem duplicar e sem trazer nan."""
+    unicos = []
+    vistos = set()
+
+    for valor in valores:
+        if pd.isna(valor):
+            continue
+
+        texto = str(valor).strip()
+        if texto.endswith(".0"):
+            texto = texto[:-2]
+
+        if texto == "" or texto.upper() in {"NAN", "NONE", "NAT", "NULL"}:
+            continue
+
+        if texto not in vistos:
+            vistos.add(texto)
+            unicos.append(texto)
+
+    return " | ".join(unicos)
+
 def criar_micro_regiao(df, casas=2):
     lat_cell = df["latitude"].round(casas)
     lon_cell = df["longitude"].round(casas)
@@ -221,6 +295,8 @@ if "df_backlog_movel" not in st.session_state:
     st.session_state.df_backlog_movel = pd.DataFrame()
 if "df_slots_movel" not in st.session_state:
     st.session_state.df_slots_movel = pd.DataFrame()
+if "df_resumo_movel" not in st.session_state:
+    st.session_state.df_resumo_movel = pd.DataFrame()
 
 # =========================================================
 # SIDEBAR
@@ -407,7 +483,7 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
         df_prev["__WO__"] = ""
         col_wo = "__WO__"
 
-    df_prev["sigla_site"] = df_prev["sigla_site"].astype(str).str.strip()
+    df_prev["sigla_site"] = df_prev["sigla_site"].astype(str).str.strip().str.upper()
     df_prev["Categoria_Preventiva"] = df_prev["tipo_preventiva"].apply(classificar_tipo_wo)
 
     df_prev = df_prev[
@@ -458,15 +534,13 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
         value_name="ID_Unico"
     ).dropna(subset=["ID_Unico"]).copy()
 
-    df_sites_long["ID_Unico"] = df_sites_long["ID_Unico"].astype(str).str.strip()
+    df_sites_long["ID_Unico"] = df_sites_long["ID_Unico"].astype(str).str.strip().str.upper()
 
     df_roteiro = pd.merge(
         df_sites_long,
         df_missoes[[
             "sigla_site",
             "Detalhe_Visita",
-            "WO_Climatizacao",
-            "WO_Energia_Eletrica",
             "Peso_Slots",
             "WO_Climatizacao",
             "WO_Energia_Eletrica"

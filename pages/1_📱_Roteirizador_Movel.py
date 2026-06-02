@@ -2,13 +2,18 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from io import BytesIO
+import unicodedata
+
+VERSAO_APP = "WO_EXCEL_V3_2026_06_01"
 
 # =========================================================
 # CONFIGURAÇÃO DA PÁGINA
 # =========================================================
 st.set_page_config(page_title="Roteirizador Móvel", layout="wide")
 st.title("📱 Roteirizador Móvel")
-st.caption("Roteirização com foco territorial, limite de deslocamento e sequência otimizada por proximidade.")
+st.caption("Roteirização com W.O no roteiro + backlog + resumo no Excel completo.")
+st.info(f"✅ Código carregado: {VERSAO_APP} — se esta mensagem não aparecer no Streamlit, o GitHub ainda está rodando o arquivo antigo.")
 
 # =========================================================
 # FUNÇÕES AUXILIARES
@@ -73,6 +78,80 @@ def classificar_visita(lista_tipos):
 
 def peso_slots_visita(detalhe):
     return 2 if "DUPLA" in str(detalhe).upper() else 1
+
+def remover_acentos(texto):
+    """Remove acentos para comparação de textos/colunas."""
+    if pd.isna(texto):
+        return ""
+    texto = str(texto)
+    texto = unicodedata.normalize("NFKD", texto)
+    return "".join(ch for ch in texto if not unicodedata.combining(ch))
+
+
+def chave_comparacao(texto):
+    """Normaliza texto removendo acento, espaço, ponto e caracteres especiais."""
+    texto = remover_acentos(texto).upper().strip()
+    return "".join(ch for ch in texto if ch.isalnum())
+
+
+def encontrar_coluna(df, nomes_possiveis):
+    """
+    Localiza uma coluna mesmo que ela esteja escrita com ponto, espaço ou acento.
+    Ex.: W.O, WO, W O, Ordem de Serviço, OS.
+    """
+    mapa_colunas = {chave_comparacao(col): col for col in df.columns}
+
+    for nome in nomes_possiveis:
+        chave = chave_comparacao(nome)
+        if chave in mapa_colunas:
+            return mapa_colunas[chave]
+
+    # Busca flexível para casos como "Nº W.O", "WO Clima", "Ordem Serviço Energia".
+    chaves_wo = {"WO", "WORKORDER", "ORDEMSERVICO", "ORDEMDE SERVICO", "ORDEMDESERVICO", "OS"}
+    for chave_col, col_original in mapa_colunas.items():
+        if "WO" in chave_col or "WORKORDER" in chave_col or "ORDEMSERVICO" in chave_col or "ORDEMDESERVICO" in chave_col:
+            return col_original
+        # Evita pegar qualquer coluna com "OS" no meio de outra palavra.
+        if chave_col == "OS" or chave_col.startswith("OS"):
+            return col_original
+
+    return None
+
+
+def classificar_tipo_wo(tipo_preventiva):
+    """Classifica a preventiva para separar a W.O em Climatização ou Energia Elétrica."""
+    txt = remover_acentos(tipo_preventiva).upper()
+
+    if "CLIMATIZ" in txt or "AR CONDICIONADO" in txt or "HVAC" in txt:
+        return "CLIMATIZACAO"
+
+    if "ENERGIA" in txt or "ELETRIC" in txt or "ELETRICA" in txt or "ELÉTRICA" in txt:
+        return "ENERGIA_ELETRICA"
+
+    return "OUTROS"
+
+
+def juntar_unicos_sem_vazio(valores):
+    """Junta W.O únicas do mesmo site/tipo, sem duplicar e sem trazer nan."""
+    unicos = []
+    vistos = set()
+
+    for valor in valores:
+        if pd.isna(valor):
+            continue
+
+        texto = str(valor).strip()
+        if texto.endswith(".0"):
+            texto = texto[:-2]
+
+        if texto == "" or texto.upper() in {"NAN", "NONE", "NAT", "NULL"}:
+            continue
+
+        if texto not in vistos:
+            vistos.add(texto)
+            unicos.append(texto)
+
+    return " | ".join(unicos)
 
 def criar_micro_regiao(df, casas=2):
     lat_cell = df["latitude"].round(casas)
@@ -219,6 +298,10 @@ if "df_backlog_movel" not in st.session_state:
     st.session_state.df_backlog_movel = pd.DataFrame()
 if "df_slots_movel" not in st.session_state:
     st.session_state.df_slots_movel = pd.DataFrame()
+if "df_resumo_movel" not in st.session_state:
+    st.session_state.df_resumo_movel = pd.DataFrame()
+if "debug_wo_movel" not in st.session_state:
+    st.session_state.debug_wo_movel = {}
 
 # =========================================================
 # SIDEBAR
@@ -226,7 +309,23 @@ if "df_slots_movel" not in st.session_state:
 with st.sidebar:
     st.header("📂 Arquivos de Entrada")
     file_sites = st.file_uploader("Base de Sites", type=["xlsx", "csv"], key="sites_movel")
-    file_prev = st.file_uploader("Base de Preventivas", type=["xlsx", "csv"], key="prev_movel")
+    file_prev = st.file_uploader("Base de Preventivas com W.O", type=["xlsx", "csv"], key="prev_movel")
+
+    if file_prev is not None:
+        try:
+            df_prev_preview = ler_arquivo(file_prev)
+            file_prev.seek(0)
+            col_wo_preview = encontrar_coluna(
+                df_prev_preview,
+                ["W.O", "WO", "W O", "Work Order", "Ordem Serviço", "Ordem de Serviço", "OS"]
+            )
+            if col_wo_preview:
+                st.success(f"W.O detectada na base de preventivas: {col_wo_preview}")
+            else:
+                st.warning("Não encontrei coluna de W.O na base de preventivas. Use W.O, WO, OS ou Ordem de Serviço.")
+        except Exception as e:
+            st.warning(f"Não consegui validar a coluna de W.O agora: {e}")
+
 
     infra_selecionada = "Nenhuma"
     df_tecnicos_dinamico = pd.DataFrame()
@@ -394,9 +493,22 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     if "tipo_preventiva" not in df_prev.columns:
         raise ValueError("A base de preventivas precisa ter a coluna 'tipo_preventiva'.")
 
-    df_prev["sigla_site"] = df_prev["sigla_site"].astype(str).str.strip()
+    # A coluna de W.O pode ser criada no arquivo de preventivas com nomes como:
+    # W.O, WO, W O, Ordem de Serviço ou OS.
+    col_wo = encontrar_coluna(
+        df_prev,
+        ["W.O", "WO", "W O", "Work Order", "Ordem Serviço", "Ordem de Serviço", "OS"]
+    )
+
+    if col_wo is None:
+        df_prev["__WO__"] = ""
+        col_wo = "__WO__"
+
+    df_prev["sigla_site"] = df_prev["sigla_site"].astype(str).str.strip().str.upper()
+    df_prev["Categoria_Preventiva"] = df_prev["tipo_preventiva"].apply(classificar_tipo_wo)
+
     df_prev = df_prev[
-        df_prev["tipo_preventiva"].astype(str).str.contains("Climatizacao|Energia", case=False, na=False)
+        df_prev["Categoria_Preventiva"].isin(["CLIMATIZACAO", "ENERGIA_ELETRICA"])
     ].copy()
 
     if df_prev.empty:
@@ -405,6 +517,30 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
     df_missoes = df_prev.groupby("sigla_site", as_index=False).agg({"tipo_preventiva": list})
     df_missoes["Detalhe_Visita"] = df_missoes["tipo_preventiva"].apply(classificar_visita)
     df_missoes["Peso_Slots"] = df_missoes["Detalhe_Visita"].apply(peso_slots_visita)
+
+    df_wo = (
+        df_prev.groupby(["sigla_site", "Categoria_Preventiva"])[col_wo]
+        .apply(juntar_unicos_sem_vazio)
+        .unstack(fill_value="")
+        .reset_index()
+    )
+
+    if "CLIMATIZACAO" not in df_wo.columns:
+        df_wo["CLIMATIZACAO"] = ""
+    if "ENERGIA_ELETRICA" not in df_wo.columns:
+        df_wo["ENERGIA_ELETRICA"] = ""
+
+    df_wo = df_wo.rename(columns={
+        "CLIMATIZACAO": "WO_Climatizacao",
+        "ENERGIA_ELETRICA": "WO_Energia_Eletrica"
+    })
+
+    df_missoes = pd.merge(
+        df_missoes,
+        df_wo[["sigla_site", "WO_Climatizacao", "WO_Energia_Eletrica"]],
+        on="sigla_site",
+        how="left"
+    )
 
     cols_ids = [c for c in ["ID_EBT", "ID_CLARO_FIXO", "ID_NET", "ID_CLARO_OMR"] if c in df_sites.columns]
     if not cols_ids:
@@ -419,11 +555,17 @@ def preparar_bases(df_sites, df_prev, infra_prioritaria):
         value_name="ID_Unico"
     ).dropna(subset=["ID_Unico"]).copy()
 
-    df_sites_long["ID_Unico"] = df_sites_long["ID_Unico"].astype(str).str.strip()
+    df_sites_long["ID_Unico"] = df_sites_long["ID_Unico"].astype(str).str.strip().str.upper()
 
     df_roteiro = pd.merge(
         df_sites_long,
-        df_missoes[["sigla_site", "Detalhe_Visita", "Peso_Slots"]],
+        df_missoes[[
+            "sigla_site",
+            "Detalhe_Visita",
+            "Peso_Slots",
+            "WO_Climatizacao",
+            "WO_Energia_Eletrica"
+        ]],
         left_on="ID_Unico",
         right_on="sigla_site",
         how="inner"
@@ -786,6 +928,8 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             "Equipe",
             "Tecnico",
             "Detalhe_Visita",
+            "WO_Climatizacao",
+            "WO_Energia_Eletrica",
             "Peso_Slots",
             "Km_Site_Anterior",
             "Km_Acumulado_Dia",
@@ -811,6 +955,8 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
             "Equipe",
             "Tecnico",
             "Detalhe_Visita",
+            "WO_Climatizacao",
+            "WO_Energia_Eletrica",
             "Peso_Slots",
             "latitude",
             "longitude"
@@ -829,6 +975,101 @@ def processar_roteiro(df_sites, df_prev, df_tecnicos, infra_prioritaria, d_inici
 
     return df_final, df_backlog, slots
 
+
+def montar_resumo_equipes(df_slots):
+    if df_slots.empty:
+        return pd.DataFrame()
+
+    resumo = (
+        df_slots.groupby(["Area", "Equipe", "Tecnico"], as_index=False)
+        .agg(
+            Dias_Disponiveis=("Data", "count"),
+            Capacidade_Total=("Capacidade_Total", "sum"),
+            Capacidade_Usada=("Capacidade_Usada", "sum"),
+            Dias_Com_Rota=("Qtd_Tarefas", lambda x: int((pd.Series(x) > 0).sum())),
+            Qtd_Tarefas=("Qtd_Tarefas", "sum")
+        )
+    )
+
+    resumo["Saldo_Capacidade"] = resumo["Capacidade_Total"] - resumo["Capacidade_Usada"]
+    resumo["Utilizacao_%"] = np.where(
+        resumo["Capacidade_Total"] > 0,
+        (resumo["Capacidade_Usada"] / resumo["Capacidade_Total"] * 100).round(1),
+        0
+    )
+
+    return resumo[[
+        "Area",
+        "Equipe",
+        "Tecnico",
+        "Dias_Disponiveis",
+        "Dias_Com_Rota",
+        "Qtd_Tarefas",
+        "Capacidade_Total",
+        "Capacidade_Usada",
+        "Saldo_Capacidade",
+        "Utilizacao_%"
+    ]]
+
+def montar_consolidado_programacao_backlog(df_programacao, df_backlog):
+    partes = []
+
+    if not df_programacao.empty:
+        prog = df_programacao.copy()
+        prog.insert(0, "Origem", "Programação")
+        partes.append(prog)
+
+    if not df_backlog.empty:
+        back = df_backlog.copy()
+        back.insert(0, "Origem", "Backlog")
+        partes.append(back)
+
+    if partes:
+        return pd.concat(partes, ignore_index=True, sort=False)
+
+    return pd.DataFrame()
+
+def gerar_excel_exportacao(df_programacao, df_backlog, df_resumo):
+    output = BytesIO()
+
+    df_consolidado = montar_consolidado_programacao_backlog(df_programacao, df_backlog)
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df_consolidado.to_excel(writer, sheet_name="Consolidado", index=False)
+        df_programacao.to_excel(writer, sheet_name="Programacao", index=False)
+        df_backlog.to_excel(writer, sheet_name="Backlog", index=False)
+        df_resumo.to_excel(writer, sheet_name="Resumo Equipes", index=False)
+
+        workbook = writer.book
+        header_fmt = workbook.add_format({
+            "bold": True,
+            "bg_color": "#1F4E78",
+            "font_color": "#FFFFFF",
+            "border": 1
+        })
+
+        for sheet_name, dataframe in {
+            "Consolidado": df_consolidado,
+            "Programacao": df_programacao,
+            "Backlog": df_backlog,
+            "Resumo Equipes": df_resumo
+        }.items():
+            worksheet = writer.sheets[sheet_name]
+
+            if dataframe.empty:
+                continue
+
+            for col_num, col_name in enumerate(dataframe.columns):
+                worksheet.write(0, col_num, col_name, header_fmt)
+                largura = max(12, min(45, dataframe[col_name].astype(str).map(len).max() + 2))
+                worksheet.set_column(col_num, col_num, largura)
+
+            worksheet.freeze_panes(1, 0)
+            worksheet.autofilter(0, 0, len(dataframe), len(dataframe.columns) - 1)
+
+    return output.getvalue()
+
+
 # =========================================================
 # EXECUÇÃO
 # =========================================================
@@ -837,6 +1078,11 @@ if file_sites and file_prev:
         try:
             df_s = ler_arquivo(file_sites)
             df_p = ler_arquivo(file_prev)
+
+            col_wo_detectada = encontrar_coluna(
+                df_p,
+                ["W.O", "WO", "W O", "Work Order", "Ordem Serviço", "Ordem de Serviço", "OS"]
+            )
 
             resultado, backlog, resumo_slots = processar_roteiro(
                 df_s,
@@ -866,10 +1112,22 @@ if file_sites and file_prev:
                     sort=False
                 )
 
+            resumo_equipes = montar_resumo_equipes(resumo_slots)
+
+            st.session_state.debug_wo_movel = {
+                "versao": VERSAO_APP,
+                "coluna_wo_detectada": col_wo_detectada if col_wo_detectada else "NÃO ENCONTRADA",
+                "linhas_programacao": int(len(resultado)),
+                "linhas_backlog": int(len(backlog)),
+                "cols_programacao": list(resultado.columns),
+                "cols_backlog": list(backlog.columns),
+            }
+
             st.session_state.df_export_movel = resultado_export
             st.session_state.df_resultado_movel = resultado
             st.session_state.df_backlog_movel = backlog
             st.session_state.df_slots_movel = resumo_slots
+            st.session_state.df_resumo_movel = resumo_equipes
             st.session_state.dados_gerados_movel = True
             st.rerun()
 
@@ -882,6 +1140,15 @@ if file_sites and file_prev:
 if st.session_state.dados_gerados_movel:
     st.success("Roteiro gerado com sucesso!")
 
+    debug_wo = st.session_state.get("debug_wo_movel", {})
+    if debug_wo:
+        st.caption(
+            f"Versão: {debug_wo.get('versao', '')} | "
+            f"Coluna W.O detectada: {debug_wo.get('coluna_wo_detectada', '')} | "
+            f"Programação: {debug_wo.get('linhas_programacao', 0)} linhas | "
+            f"Backlog: {debug_wo.get('linhas_backlog', 0)} linhas"
+        )
+
     tab1, tab2, tab3 = st.tabs(["📋 Programação", "⚠️ Backlog", "📊 Resumo Equipes"])
 
     with tab1:
@@ -891,26 +1158,21 @@ if st.session_state.dados_gerados_movel:
         st.dataframe(st.session_state.df_backlog_movel, use_container_width=True)
 
     with tab3:
-        df_slots = st.session_state.df_slots_movel.copy()
-        if not df_slots.empty:
-            resumo = (
-                df_slots.groupby(["Area", "Equipe", "Tecnico"], as_index=False)
-                .agg(
-                    Dias_Disponiveis=("Data", "count"),
-                    Capacidade_Total=("Capacidade_Total", "sum"),
-                    Capacidade_Usada=("Capacidade_Usada", "sum"),
-                    Dias_Com_Rota=("Qtd_Tarefas", lambda x: int((pd.Series(x) > 0).sum())),
-                    Qtd_Tarefas=("Qtd_Tarefas", "sum")
-                )
-            )
-            st.dataframe(resumo, use_container_width=True)
+        df_resumo = st.session_state.df_resumo_movel.copy()
+        if not df_resumo.empty:
+            st.dataframe(df_resumo, use_container_width=True)
         else:
             st.info("Nenhum resumo disponível.")
 
-    csv = st.session_state.df_export_movel.to_csv(index=False, sep=";").encode("utf-8-sig")
+    excel = gerar_excel_exportacao(
+        st.session_state.df_resultado_movel.copy(),
+        st.session_state.df_backlog_movel.copy(),
+        st.session_state.df_resumo_movel.copy()
+    )
+
     st.download_button(
-        "📥 Baixar Planilha Final",
-        csv,
-        "roteiro_movel_planejado.csv",
-        "text/csv"
+        "📥 Baixar Excel Completo",
+        excel,
+        "roteiro_movel_planejado.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )

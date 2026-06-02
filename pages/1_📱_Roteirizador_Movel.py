@@ -13,7 +13,7 @@ VERSAO_APP = "WO_EXCEL_V3_2026_06_01"
 st.set_page_config(page_title="Roteirizador Móvel", layout="wide")
 st.title("📱 Roteirizador Móvel")
 st.caption("Roteirização com W.O no roteiro + backlog + resumo no Excel completo.")
-st.info(f"✅ Código carregado: {VERSAO_APP} )
+st.info(f"✅ Código carregado: {VERSAO_APP} ")
 
 # =========================================================
 # FUNÇÕES AUXILIARES

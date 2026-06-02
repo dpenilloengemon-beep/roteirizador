@@ -5,12 +5,15 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import unicodedata
 
+VERSAO_APP = "WO_EXCEL_V3_2026_06_01"
+
 # =========================================================
 # CONFIGURAÇÃO DA PÁGINA
 # =========================================================
 st.set_page_config(page_title="Roteirizador Móvel", layout="wide")
 st.title("📱 Roteirizador Móvel")
-st.caption("Roteirização com foco territorial, limite de deslocamento e sequência otimizada por proximidade.")
+st.caption("Roteirização com W.O no roteiro + backlog + resumo no Excel completo.")
+st.info(f"✅ Código carregado: {VERSAO_APP} — se esta mensagem não aparecer no Streamlit, o GitHub ainda está rodando o arquivo antigo.")
 
 # =========================================================
 # FUNÇÕES AUXILIARES
@@ -297,6 +300,8 @@ if "df_slots_movel" not in st.session_state:
     st.session_state.df_slots_movel = pd.DataFrame()
 if "df_resumo_movel" not in st.session_state:
     st.session_state.df_resumo_movel = pd.DataFrame()
+if "debug_wo_movel" not in st.session_state:
+    st.session_state.debug_wo_movel = {}
 
 # =========================================================
 # SIDEBAR
@@ -304,7 +309,23 @@ if "df_resumo_movel" not in st.session_state:
 with st.sidebar:
     st.header("📂 Arquivos de Entrada")
     file_sites = st.file_uploader("Base de Sites", type=["xlsx", "csv"], key="sites_movel")
-    file_prev = st.file_uploader("Base de Preventivas", type=["xlsx", "csv"], key="prev_movel")
+    file_prev = st.file_uploader("Base de Preventivas com W.O", type=["xlsx", "csv"], key="prev_movel")
+
+    if file_prev is not None:
+        try:
+            df_prev_preview = ler_arquivo(file_prev)
+            file_prev.seek(0)
+            col_wo_preview = encontrar_coluna(
+                df_prev_preview,
+                ["W.O", "WO", "W O", "Work Order", "Ordem Serviço", "Ordem de Serviço", "OS"]
+            )
+            if col_wo_preview:
+                st.success(f"W.O detectada na base de preventivas: {col_wo_preview}")
+            else:
+                st.warning("Não encontrei coluna de W.O na base de preventivas. Use W.O, WO, OS ou Ordem de Serviço.")
+        except Exception as e:
+            st.warning(f"Não consegui validar a coluna de W.O agora: {e}")
+
 
     infra_selecionada = "Nenhuma"
     df_tecnicos_dinamico = pd.DataFrame()
@@ -1058,6 +1079,11 @@ if file_sites and file_prev:
             df_s = ler_arquivo(file_sites)
             df_p = ler_arquivo(file_prev)
 
+            col_wo_detectada = encontrar_coluna(
+                df_p,
+                ["W.O", "WO", "W O", "Work Order", "Ordem Serviço", "Ordem de Serviço", "OS"]
+            )
+
             resultado, backlog, resumo_slots = processar_roteiro(
                 df_s,
                 df_p,
@@ -1088,6 +1114,15 @@ if file_sites and file_prev:
 
             resumo_equipes = montar_resumo_equipes(resumo_slots)
 
+            st.session_state.debug_wo_movel = {
+                "versao": VERSAO_APP,
+                "coluna_wo_detectada": col_wo_detectada if col_wo_detectada else "NÃO ENCONTRADA",
+                "linhas_programacao": int(len(resultado)),
+                "linhas_backlog": int(len(backlog)),
+                "cols_programacao": list(resultado.columns),
+                "cols_backlog": list(backlog.columns),
+            }
+
             st.session_state.df_export_movel = resultado_export
             st.session_state.df_resultado_movel = resultado
             st.session_state.df_backlog_movel = backlog
@@ -1104,6 +1139,15 @@ if file_sites and file_prev:
 # =========================================================
 if st.session_state.dados_gerados_movel:
     st.success("Roteiro gerado com sucesso!")
+
+    debug_wo = st.session_state.get("debug_wo_movel", {})
+    if debug_wo:
+        st.caption(
+            f"Versão: {debug_wo.get('versao', '')} | "
+            f"Coluna W.O detectada: {debug_wo.get('coluna_wo_detectada', '')} | "
+            f"Programação: {debug_wo.get('linhas_programacao', 0)} linhas | "
+            f"Backlog: {debug_wo.get('linhas_backlog', 0)} linhas"
+        )
 
     tab1, tab2, tab3 = st.tabs(["📋 Programação", "⚠️ Backlog", "📊 Resumo Equipes"])
 

@@ -7,7 +7,7 @@ import unicodedata
 import re
 import pydeck as pdk
 
-VERSAO_APP = "ROTEIRIZADOR_MOVEL_V6_DASH_ACOMPANHAMENTO"
+VERSAO_APP = "ROTEIRIZADOR_MOVEL_V7_REGRAS_ACESSO_MAPA"
 
 # =========================================================
 # CONFIGURAÇÃO VISUAL
@@ -42,6 +42,7 @@ st.markdown(
         .kpi-value {color: #0B1F3A !important; font-size: 2.05rem; font-weight: 850; line-height: 1;}
         .kpi-help {color: #64748B !important; font-size: 0.78rem; margin-top: 7px;}
         .legend-pill {display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:999px; background:#F8FAFC; color:#0F172A; margin:3px 4px 3px 0; border:1px solid #E2E8F0; font-size:0.78rem;}
+        .map-note {color:#B7C3D7; font-size:0.86rem; margin-top:-4px; margin-bottom:10px;}
         .dot {display:inline-block; width:10px; height:10px; border-radius:50%;}
         @media (max-width: 1000px) {.kpi-wrap {grid-template-columns: repeat(2, minmax(0, 1fr));}}
         @media (max-width: 620px) {.kpi-wrap {grid-template-columns: 1fr;}}
@@ -237,18 +238,45 @@ def gerar_datas_equipe(data_inicio, data_fim, equipe_idx, trabalhar_sabado_alter
     return sorted(datas)
 
 
+def texto_linha(row, colunas):
+    partes = []
+    for col in colunas:
+        if col in row.index:
+            val = row.get(col, "")
+            if not pd.isna(val):
+                partes.append(normalizar_valor(val))
+    return " | ".join(partes)
+
+
+def site_pode_na_data(row, data_ref):
+    """Regras de calendário: particularidade de acesso e polesite só entram após o dia 10."""
+    data_ref = pd.Timestamp(data_ref)
+    if data_ref.day <= 10:
+        particularidade = str(row.get("Particularidade_Acesso", "")).strip()
+        infra = normalizar_valor(row.get("Infraestrutura", ""))
+        restricao = normalizar_valor(row.get("Restricao_Agendamento", ""))
+        if particularidade:
+            return False
+        if "POLESITE" in infra or "POLE SITE" in infra or "POLE-SITE" in infra:
+            return False
+        if "POLESITE" in restricao or "PARTICULARIDADE" in restricao:
+            return False
+    return True
+
+
 def kpi_card(label, value, help_text=""):
-    return f"""
-    <div class="kpi-card">
-        <div class="kpi-label">{label}</div>
-        <div class="kpi-value">{value}</div>
-        <div class="kpi-help">{help_text}</div>
-    </div>
-    """
+    # HTML em linha única evita que o Markdown do Streamlit interprete os cards seguintes como bloco de código.
+    return (
+        f'<div class="kpi-card">'
+        f'<div class="kpi-label">{label}</div>'
+        f'<div class="kpi-value">{value}</div>'
+        f'<div class="kpi-help">{help_text}</div>'
+        f'</div>'
+    )
 
 
 def render_kpis(cards):
-    html = '<div class="kpi-wrap">' + "".join(cards) + "</div>"
+    html = '<div class="kpi-wrap">' + "".join(cards) + '</div>'
     st.markdown(html, unsafe_allow_html=True)
 
 # =========================================================
@@ -383,6 +411,7 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
 
     mask_movel = pd.Series(False, index=df_lista.index)
     mask_eric = pd.Series(False, index=df_lista.index)
+    equipe_norm = pd.Series("", index=df_lista.index)
 
     if col_unidade is not None:
         unidade_norm = df_lista[col_unidade].apply(normalizar_valor)
@@ -392,15 +421,38 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
         equipe_norm = df_lista[col_equipe_resp].apply(normalizar_valor)
         mask_eric = equipe_norm.str.contains("ERIC", na=False)
 
+    # Correções operacionais:
+    # - Site TIPO 0 nunca entra como móvel, mesmo que a planilha venha marcada como MÓVEL.
+    # - MRB veio marcado como móvel por erro de cadastro; por segurança, retiramos sites com MRB na sigla/IDs.
+    col_tipologia = encontrar_coluna(df_lista, ["TIPOLOGIA", "TIPOLOGIA DO SITE"])
+    col_tipologia_auto = encontrar_coluna(df_lista, ["TIPOLOGIA AUTOMAÇÃO", "TIPOLOGIA AUTOMACAO"])
+    textos_tipo0 = pd.Series("", index=df_lista.index)
+    for col_tipo0 in [col_tipologia, col_tipologia_auto]:
+        if col_tipo0 is not None:
+            textos_tipo0 = textos_tipo0 + " | " + df_lista[col_tipo0].apply(normalizar_valor)
+    mask_tipo0 = textos_tipo0.str.contains(r"\bTIPO 0\b", regex=True, na=False)
+
+    colunas_texto_mrb = [c for c in [col_equipe_resp, "ID_EBT", "ID_CLARO_FIXO", "ID_NET", "ID_CLARO_OMR", "ID_SITE_MAIN", "SIGLA_CONCAT"] if c in df_lista.columns]
+    texto_mrb = pd.Series("", index=df_lista.index)
+    for col_mrb in colunas_texto_mrb:
+        texto_mrb = texto_mrb + " | " + df_lista[col_mrb].apply(normalizar_valor)
+    mask_mrb = texto_mrb.str.contains("MRB", na=False)
+
     df_lista["Regra_Escopo_Movel"] = np.select(
         [mask_movel & mask_eric, mask_movel, mask_eric],
         ["MÓVEL + ERIC", "MÓVEL", "ERIC"],
         default="FORA DO ESCOPO",
     )
-    df_lista = df_lista[mask_movel | mask_eric].copy()
+    df_lista["Motivo_Exclusao_Escopo"] = np.select(
+        [mask_tipo0, mask_mrb],
+        ["Excluído: site TIPO 0", "Excluído: MRB cadastrado como móvel"],
+        default="",
+    )
+
+    df_lista = df_lista[(mask_movel | mask_eric) & ~mask_tipo0 & ~mask_mrb].copy()
 
     if df_lista.empty:
-        raise ValueError("Depois do filtro MÓVEL e/ou ERIC, a Lista de Estações ficou vazia.")
+        raise ValueError("Depois dos filtros MÓVEL/ERIC, exclusão de TIPO 0 e exclusão de MRB, a Lista de Estações ficou vazia.")
 
     # A Carga TOA deve considerar somente UF = SPC.
     col_uf_carga = encontrar_coluna(df_carga, ["UF", "Regional", "REGIONAL"])
@@ -537,11 +589,33 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
     df_roteiro["Micro_Regiao"] = df_roteiro["Micro_Regiao"].fillna(df_roteiro["Area"]).astype(str).str.upper()
     df_roteiro["Rank_Tipo_Site"] = df_roteiro["Prioridade"].apply(tipo_site_rank)
 
+    texto_prioridade = (
+        df_roteiro.get("Infraestrutura", pd.Series("", index=df_roteiro.index)).apply(normalizar_valor) + " | " +
+        df_roteiro.get("Prioridade", pd.Series("", index=df_roteiro.index)).apply(normalizar_valor) + " | " +
+        df_roteiro.get("GPON", pd.Series("", index=df_roteiro.index)).apply(normalizar_valor) + " | " +
+        df_roteiro.get("ESTRATEGICO", pd.Series("", index=df_roteiro.index)).apply(normalizar_valor)
+    )
+    df_roteiro["GPON_Flag"] = np.where(texto_prioridade.str.contains("GPON") | df_roteiro.get("GPON", pd.Series("", index=df_roteiro.index)).apply(normalizar_valor).isin(["SIM", "S", "YES"]), "SIM", "NÃO")
+    df_roteiro["Estrategico_Flag"] = np.where(texto_prioridade.str.contains("ESTRATEGICO") | df_roteiro.get("ESTRATEGICO", pd.Series("", index=df_roteiro.index)).apply(normalizar_valor).isin(["SIM", "S", "YES"]), "SIM", "NÃO")
+    df_roteiro["Rank_Prioridade_Operacional"] = np.select(
+        [df_roteiro["GPON_Flag"].eq("SIM"), df_roteiro["Estrategico_Flag"].eq("SIM"), df_roteiro["Prioridade"].apply(normalizar_valor).str.contains("CONCENTRADOR", na=False)],
+        [1, 2, 3],
+        default=4,
+    )
+
     if not df_acessos.empty:
         df_roteiro = df_roteiro.merge(df_acessos, on="Sigla Site", how="left")
     else:
         df_roteiro["Particularidade_Acesso"] = ""
     df_roteiro["Particularidade_Acesso"] = df_roteiro["Particularidade_Acesso"].fillna("")
+    df_roteiro["Restricao_Agendamento"] = ""
+    df_roteiro.loc[df_roteiro["Particularidade_Acesso"].astype(str).str.strip().ne(""), "Restricao_Agendamento"] = "Somente após dia 10: particularidade de acesso"
+    mask_polesite = df_roteiro["Infraestrutura"].apply(normalizar_valor).str.contains("POLESITE|POLE SITE|POLE-SITE", regex=True, na=False)
+    df_roteiro.loc[mask_polesite, "Restricao_Agendamento"] = np.where(
+        df_roteiro.loc[mask_polesite, "Restricao_Agendamento"].astype(str).str.strip().ne(""),
+        df_roteiro.loc[mask_polesite, "Restricao_Agendamento"].astype(str) + " | Somente após dia 10: polesite",
+        "Somente após dia 10: polesite",
+    )
 
     return df_roteiro.reset_index(drop=True)
 
@@ -620,9 +694,11 @@ def ordenar_candidatos(df, data_ref, priorizar_greenfield_ate):
         0,
         1,
     )
+    if "Rank_Prioridade_Operacional" not in df.columns:
+        df["Rank_Prioridade_Operacional"] = df.get("Rank_Tipo_Site", pd.Series(4, index=df.index))
     return df.sort_values(
-        by=["Prioridade_Greenfield", "Regiao_Roteiro", "Rank_Tipo_Site", "Sigla Site"],
-        ascending=[True, True, True, True],
+        by=["Prioridade_Greenfield", "Regiao_Roteiro", "Rank_Prioridade_Operacional", "Rank_Tipo_Site", "Sigla Site"],
+        ascending=[True, True, True, True, True],
     )
 
 
@@ -640,6 +716,10 @@ def montar_dia_rota(pendentes, data_ref, cap_dia, max_km_dia, priorizar_greenfie
 
     while capacidade > 0 and not pendentes.empty:
         candidatos = pendentes[pd.to_numeric(pendentes["Peso_Slots"], errors="coerce").fillna(1) <= capacidade].copy()
+        if candidatos.empty:
+            break
+
+        candidatos = candidatos[candidatos.apply(lambda r: site_pode_na_data(r, data_ref), axis=1)].copy()
         if candidatos.empty:
             break
 
@@ -731,13 +811,15 @@ def calcular_distancia_sequencial(df):
     if len(df) > 1:
         pend = df.copy()
         saida = []
-        atual = pend.sort_values(["Regiao_Roteiro", "Rank_Tipo_Site", "Sigla Site"]).iloc[0]
+        if "Rank_Prioridade_Operacional" not in pend.columns:
+            pend["Rank_Prioridade_Operacional"] = pend.get("Rank_Tipo_Site", pd.Series(4, index=pend.index))
+        atual = pend.sort_values(["Regiao_Roteiro", "Rank_Prioridade_Operacional", "Rank_Tipo_Site", "Sigla Site"]).iloc[0]
         saida.append(atual)
         pend = pend.drop(index=atual.name)
         while not pend.empty:
             pend = pend.copy()
             pend["Dist_TMP"] = haversine_km(float(atual["latitude"]), float(atual["longitude"]), pend["latitude"].astype(float).values, pend["longitude"].astype(float).values)
-            pend = pend.sort_values(["Dist_TMP", "Regiao_Roteiro", "Rank_Tipo_Site", "Sigla Site"])
+            pend = pend.sort_values(["Dist_TMP", "Regiao_Roteiro", "Rank_Prioridade_Operacional", "Rank_Tipo_Site", "Sigla Site"])
             atual = pend.iloc[0]
             saida.append(atual)
             pend = pend.drop(index=atual.name)
@@ -777,11 +859,11 @@ def formatar_saida(df, cap_dia, backlog=False):
         df["Ordem"] = "Cap. consumida: " + df["Capacidade_Consumida"].astype(int).astype(str) + f"/{cap_dia}"
 
     colunas = [
-        "Data Programada", "Sequencia_Atendimento", "Ordem", "Prioridade", "Infraestrutura",
+        "Data Programada", "Sequencia_Atendimento", "Ordem", "Prioridade", "GPON_Flag", "Estrategico_Flag", "Infraestrutura",
         "Area", "Micro_Regiao", "Municipio", "Bairro_Roteiro", "Regiao_Roteiro",
         "Sigla Site Anterior", "Sigla Site", "Endereco", "Equipe", "Tecnico", "Detalhe_Visita",
         "WO_Climatizacao", "WO_Energia_Eletrica", "Peso_Slots", "Km_Site_Anterior", "Km_Acumulado_Dia",
-        "latitude", "longitude", "ID_Site_Main", "Regra_Escopo_Movel", "Particularidade_Acesso", "Observacao_WO_Carga",
+        "latitude", "longitude", "ID_Site_Main", "Regra_Escopo_Movel", "Particularidade_Acesso", "Restricao_Agendamento", "Observacao_WO_Carga",
     ]
     for c in colunas:
         if c not in df.columns:
@@ -1139,14 +1221,40 @@ def preparar_mapa(df):
     return mapa
 
 
+def preparar_rotas_mapa(mapa):
+    linhas = []
+    if mapa.empty or "Sequencia_Atendimento" not in mapa.columns:
+        return pd.DataFrame(columns=["Equipe", "path", "color"])
+    tmp = mapa.copy()
+    tmp["Sequencia_Atendimento"] = pd.to_numeric(tmp["Sequencia_Atendimento"], errors="coerce").fillna(9999)
+    for equipe, grupo in tmp.sort_values(["Equipe", "Sequencia_Atendimento"]).groupby("Equipe"):
+        coords = grupo[["longitude", "latitude"]].dropna().values.tolist()
+        if len(coords) >= 2:
+            linhas.append({"Equipe": equipe, "path": coords, "color": cor_por_equipe(equipe)})
+    return pd.DataFrame(linhas)
+
+
 def exibir_mapa_programacao(df_programacao):
     if df_programacao.empty:
         st.info("Nenhum ponto para exibir no mapa.")
         return
 
     datas = sorted(df_programacao["Data Programada"].dropna().astype(str).unique().tolist(), key=lambda x: pd.to_datetime(x, dayfirst=True, errors="coerce"))
-    data_sel = st.selectbox("Selecione o dia para ver a atuação das equipes", datas)
-    df_dia = df_programacao[df_programacao["Data Programada"].astype(str).eq(str(data_sel))].copy()
+
+    col_filtro1, col_filtro2, col_filtro3, col_filtro4 = st.columns([1.2, 1.4, 0.9, 0.9])
+    with col_filtro1:
+        data_sel = st.selectbox("Dia do mapa", datas)
+
+    df_dia_base = df_programacao[df_programacao["Data Programada"].astype(str).eq(str(data_sel))].copy()
+    equipes_dia = sorted(df_dia_base["Equipe"].dropna().astype(str).unique().tolist())
+    with col_filtro2:
+        equipes_sel = st.multiselect("Equipes no mapa", equipes_dia, default=equipes_dia)
+    with col_filtro3:
+        mostrar_labels = st.checkbox("Mostrar siglas", value=True)
+    with col_filtro4:
+        mostrar_linhas = st.checkbox("Mostrar rota", value=True)
+
+    df_dia = df_dia_base[df_dia_base["Equipe"].astype(str).isin(equipes_sel)].copy() if equipes_sel else df_dia_base.iloc[0:0].copy()
     mapa = preparar_mapa(df_dia)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1156,34 +1264,60 @@ def exibir_mapa_programacao(df_programacao):
     c4.metric("Com particularidade", int((df_dia["Particularidade_Acesso"].astype(str).str.strip() != "").sum()) if "Particularidade_Acesso" in df_dia.columns else 0)
 
     if mapa.empty:
-        st.warning("Os sites deste dia estão sem latitude/longitude válida.")
+        st.warning("Os sites deste dia estão sem latitude/longitude válida ou nenhuma equipe foi selecionada.")
         return
 
     center = {"lat": float(mapa["latitude"].mean()), "lon": float(mapa["longitude"].mean())}
-    layer = pdk.Layer(
+    raio_ponto = 220 if len(mapa) <= 45 else 150
+    zoom = 11.0 if len(mapa) <= 40 else 10.2
+
+    layers = []
+    if mostrar_linhas:
+        rotas = preparar_rotas_mapa(mapa)
+        if not rotas.empty:
+            layers.append(pdk.Layer(
+                "PathLayer",
+                data=rotas,
+                get_path="path",
+                get_color="color",
+                width_min_pixels=3,
+                rounded=True,
+                pickable=True,
+            ))
+
+    layers.append(pdk.Layer(
         "ScatterplotLayer",
         data=mapa,
         get_position="[longitude, latitude]",
-        get_radius=130,
-        get_fill_color="[Cor_R, Cor_G, Cor_B, 185]",
+        get_radius=raio_ponto,
+        get_fill_color="[Cor_R, Cor_G, Cor_B, 210]",
         get_line_color="[255, 255, 255]",
-        line_width_min_pixels=1,
+        line_width_min_pixels=2,
         pickable=True,
-    )
-    text_layer = pdk.Layer(
-        "TextLayer",
-        data=mapa,
-        get_position="[longitude, latitude]",
-        get_text="Sigla Site",
-        get_size=11,
-        get_color="[20, 20, 20]",
-        get_angle=0,
-        get_text_anchor="middle",
-        get_alignment_baseline="bottom",
-    )
-    view_state = pdk.ViewState(latitude=center["lat"], longitude=center["lon"], zoom=10.5, pitch=0)
+    ))
+
+    if mostrar_labels:
+        layers.append(pdk.Layer(
+            "TextLayer",
+            data=mapa,
+            get_position="[longitude, latitude]",
+            get_text="Sigla Site",
+            get_size=13,
+            get_color="[12, 22, 38]",
+            get_angle=0,
+            get_text_anchor="middle",
+            get_alignment_baseline="bottom",
+        ))
+
+    st.markdown('<div class="map-note">Dica: use o botão de tela cheia do mapa e filtre uma ou poucas equipes para enxergar melhor a atuação de cada rota.</div>', unsafe_allow_html=True)
+    view_state = pdk.ViewState(latitude=center["lat"], longitude=center["lon"], zoom=zoom, pitch=0)
     tooltip = {"text": "{Tooltip}"}
-    st.pydeck_chart(pdk.Deck(layers=[layer, text_layer], initial_view_state=view_state, tooltip=tooltip, map_style="light"), use_container_width=True)
+    deck = pdk.Deck(layers=layers, initial_view_state=view_state, tooltip=tooltip, map_style="light")
+    try:
+        st.pydeck_chart(deck, use_container_width=True, height=760)
+    except TypeError:
+        # Compatibilidade com versões antigas do Streamlit que ainda não aceitam o parâmetro height.
+        st.pydeck_chart(deck, use_container_width=True)
 
     equipes = sorted(mapa["Equipe"].dropna().astype(str).unique().tolist())
     legenda = "".join(
@@ -1191,7 +1325,9 @@ def exibir_mapa_programacao(df_programacao):
         for eq in equipes
     )
     st.markdown(legenda, unsafe_allow_html=True)
-    st.dataframe(df_dia, use_container_width=True, hide_index=True)
+
+    with st.expander("Ver tabela do dia"):
+        st.dataframe(df_dia, use_container_width=True, hide_index=True)
 
 # =========================================================
 # SIDEBAR / ENTRADAS
@@ -1240,7 +1376,7 @@ with st.sidebar:
 # EXECUÇÃO DA ROTEIRIZAÇÃO
 # =========================================================
 if file_lista and file_carga:
-    st.markdown('<div class="section-card"><b>Pronto para gerar.</b><br><span class="muted">O robô vai filtrar UF = SPC, escopo MÓVEL e/ou ERIC, somente Climatização/Energia, agrupar por bairro/região e exportar no padrão do roteiro.</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-card"><b>Pronto para gerar.</b><br><span class="muted">O robô vai filtrar UF = SPC, escopo MÓVEL e/ou ERIC, excluir TIPO 0/MRB, manter somente Climatização/Energia, respeitar acesso/polesite após dia 10, priorizar GPON/Estratégico dentro da região e exportar no padrão do roteiro.</span></div>', unsafe_allow_html=True)
 
     if st.button("🚀 Gerar roteiro móvel", type="primary", use_container_width=True):
         try:
@@ -1330,7 +1466,7 @@ if "df_programacao" in st.session_state:
     pct_prog = (programados / total_roteirizavel * 100) if total_roteirizavel else 0
 
     render_kpis([
-        kpi_card("Sites roteirizáveis", f"{total_roteirizavel:,}".replace(",", "."), "Após filtros: SPC + Móvel/ERIC + Clima/Energia"),
+        kpi_card("Sites roteirizáveis", f"{total_roteirizavel:,}".replace(",", "."), "Após filtros: SPC + Móvel/ERIC - Tipo 0/MRB + Clima/Energia"),
         kpi_card("Sites programados", f"{programados:,}".replace(",", "."), f"{pct_prog:.1f}% do escopo filtrado".replace(".", ",")),
         kpi_card("Sites sem programação", f"{backlog:,}".replace(",", "."), "Entraram no backlog"),
         kpi_card("Peso programado", f"{peso_programado:,}".replace(",", "."), f"{particularidade} com particularidade de acesso"),

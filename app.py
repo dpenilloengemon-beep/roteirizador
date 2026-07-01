@@ -7,12 +7,12 @@ import unicodedata
 import re
 import pydeck as pdk
 
-VERSAO_APP = "ROTEIRIZADOR_MOVEL_V7_REGRAS_ACESSO_MAPA"
+VERSAO_APP = "ROTEIRIZADOR_PREVENTIVAS_CLARO_INFRA"
 
 # =========================================================
 # CONFIGURAÇÃO VISUAL
 # =========================================================
-st.set_page_config(page_title="Roteirizador Móvel", page_icon="📍", layout="wide")
+st.set_page_config(page_title="Roteirizador Preventivas", page_icon="📍", layout="wide")
 
 st.markdown(
     """

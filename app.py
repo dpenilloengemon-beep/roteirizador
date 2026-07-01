@@ -5,14 +5,25 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import unicodedata
 import re
+import os
+import base64
+from urllib.parse import quote
+from pathlib import Path
+import requests
+import msal
 import pydeck as pdk
 
-VERSAO_APP = "ROTEIRIZADOR_PREVENTIVAS_CLARO_INFRA"
+VERSAO_APP = "ROTEIRIZADOR_MOVEL_V10_SHAREPOINT_ONLINE"
+
+NOME_ROTEIRO_PADRAO = "roteiro_atual.xlsx"
+NOME_CRONOGRAMA_PADRAO = "cronograma_atual.xlsx"
+PASTA_ONEDRIVE_PADRAO = r"C:\Users\damares.penillo\OneDrive - Engemon Comércio e Serviços Técnicos LTDA\01. Automações\Roteirizador_Preventivas\Roteiros"
+PASTA_SHAREPOINT_URL_PADRAO = "https://engemonbr-my.sharepoint.com/personal/damares_penillo_engemon_com_br/_layouts/15/SkySyncRedir.aspx?Type=2&ResourceId=98b514e5c21f418485e5329580dbd447&View=0"
 
 # =========================================================
 # CONFIGURAÇÃO VISUAL
 # =========================================================
-st.set_page_config(page_title="Roteirizador Preventivas", page_icon="📍", layout="wide")
+st.set_page_config(page_title="Roteirizador Móvel", page_icon="📍", layout="wide")
 
 st.markdown(
     """
@@ -51,12 +62,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="app-title">📍 Roteirizador Móvel</div>', unsafe_allow_html=True)
+st.markdown('<div class="app-title">📍 Roteirizador Móvel | PCP</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="app-subtitle">Programação automática por bairro/região, mapa diário por equipe e acompanhamento do realizado.</div>',
+    '<div class="app-subtitle">Planejamento, acompanhamento e reprogramação das preventivas móveis do contrato INFRA CLARO SPC.</div>',
     unsafe_allow_html=True,
 )
-st.caption(f"Versão carregada: {VERSAO_APP}")
+st.markdown(
+    """
+    <div class="section-card">
+        <div style="font-size:1.05rem; font-weight:800;">Desenvolvido pelo PCP</div>
+        <div class="muted">Uso interno • Contrato INFRA CLARO SPC • Dashboard online com roteiro atual e cronograma atualizado</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =========================================================
 # FUNÇÕES AUXILIARES
@@ -219,6 +238,188 @@ def formatar_data_br(valor):
         return ""
 
 
+def limpar_caminho_arquivo(caminho):
+    """Limpa caminhos copiados do Windows/OneDrive, removendo aspas e espaços extras."""
+    if caminho is None:
+        return ""
+    txt = str(caminho).strip().strip('"').strip("'").strip()
+    return os.path.expandvars(os.path.expanduser(txt))
+
+
+def caminho_existe(caminho):
+    caminho = limpar_caminho_arquivo(caminho)
+    return bool(caminho) and Path(caminho).exists()
+
+
+def resolver_caminho_excel(caminho, nome_padrao=NOME_ROTEIRO_PADRAO):
+    """Aceita tanto caminho de arquivo .xlsx quanto caminho de pasta."""
+    caminho = limpar_caminho_arquivo(caminho)
+    if not caminho:
+        return ""
+    p = Path(caminho)
+    if p.suffix.lower() in {".xlsx", ".xls"}:
+        return str(p)
+    return str(p / nome_padrao)
+
+
+def resolver_com_fallback(caminho, nome_padrao):
+    """
+    Procura o arquivo no caminho informado, na pasta dados/ do app e na pasta do app.
+    Isso permite usar tanto OneDrive local quanto publicação com os arquivos junto ao projeto.
+    """
+    candidatos = []
+
+    if caminho:
+        candidatos.append(resolver_caminho_excel(caminho, nome_padrao))
+
+    try:
+        app_dir = Path(__file__).resolve().parent
+    except Exception:
+        app_dir = Path.cwd()
+
+    candidatos.extend([
+        str(app_dir / "dados" / nome_padrao),
+        str(app_dir / nome_padrao),
+        str(Path.cwd() / "dados" / nome_padrao),
+        str(Path.cwd() / nome_padrao),
+        str(Path(PASTA_ONEDRIVE_PADRAO) / nome_padrao),
+    ])
+
+    vistos = set()
+    candidatos_unicos = []
+    for c in candidatos:
+        if c and c not in vistos:
+            vistos.add(c)
+            candidatos_unicos.append(c)
+
+    for c in candidatos_unicos:
+        if Path(c).exists():
+            return c
+
+    return candidatos_unicos[0] if candidatos_unicos else ""
+
+
+def obter_config_sharepoint():
+    """Lê as credenciais do Microsoft Graph em st.secrets, sem expor nada para o usuário."""
+    cfg = {}
+    try:
+        if "sharepoint" in st.secrets:
+            cfg = dict(st.secrets["sharepoint"])
+    except Exception:
+        cfg = {}
+
+    tenant_id = cfg.get("tenant_id", "") or cfg.get("TENANT_ID", "")
+    client_id = cfg.get("client_id", "") or cfg.get("CLIENT_ID", "")
+    client_secret = cfg.get("client_secret", "") or cfg.get("CLIENT_SECRET", "")
+    folder_url = cfg.get("folder_url", "") or cfg.get("FOLDER_URL", "")
+
+    return {
+        "tenant_id": tenant_id,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "folder_url": folder_url,
+    }
+
+
+def sharepoint_config_ok(cfg):
+    return bool(cfg.get("tenant_id") and cfg.get("client_id") and cfg.get("client_secret"))
+
+
+@st.cache_data(ttl=45 * 60, show_spinner=False)
+def obter_token_graph(tenant_id, client_id, client_secret):
+    app = msal.ConfidentialClientApplication(
+        client_id=client_id,
+        authority=f"https://login.microsoftonline.com/{tenant_id}",
+        client_credential=client_secret,
+    )
+    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+    if "access_token" not in result:
+        erro = result.get("error_description") or result.get("error") or "Falha ao autenticar no Microsoft Graph."
+        raise RuntimeError(erro)
+    return result["access_token"]
+
+
+def share_id_from_url(url):
+    token = base64.urlsafe_b64encode(str(url).encode("utf-8")).decode("utf-8").rstrip("=")
+    return "u!" + token
+
+
+@st.cache_data(ttl=10 * 60, show_spinner=False)
+def resolver_pasta_sharepoint(folder_url, tenant_id, client_id, client_secret):
+    """Resolve um link de pasta do SharePoint/OneDrive para drive_id e item_id."""
+    token = obter_token_graph(tenant_id, client_id, client_secret)
+    headers = {"Authorization": f"Bearer {token}"}
+    share_id = share_id_from_url(folder_url)
+    url = f"https://graph.microsoft.com/v1.0/shares/{share_id}/driveItem?$select=id,name,parentReference,webUrl,folder"
+    resp = requests.get(url, headers=headers, timeout=45)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Não consegui acessar a pasta SharePoint ({resp.status_code}). Verifique permissões do app no Azure/Entra e o link da pasta.")
+    item = resp.json()
+    drive_id = item.get("parentReference", {}).get("driveId")
+    item_id = item.get("id")
+    if not drive_id or not item_id:
+        raise RuntimeError("Não consegui identificar a biblioteca/pasta do SharePoint pelo link informado.")
+    return {"drive_id": drive_id, "item_id": item_id, "name": item.get("name", ""), "webUrl": item.get("webUrl", "")}
+
+
+@st.cache_data(ttl=5 * 60, show_spinner=False)
+def baixar_arquivo_sharepoint(folder_url, nome_arquivo, tenant_id, client_id, client_secret):
+    """Baixa um arquivo que está dentro da pasta SharePoint informada."""
+    pasta = resolver_pasta_sharepoint(folder_url, tenant_id, client_id, client_secret)
+    token = obter_token_graph(tenant_id, client_id, client_secret)
+    headers = {"Authorization": f"Bearer {token}"}
+    arquivo_url = (
+        f"https://graph.microsoft.com/v1.0/drives/{pasta['drive_id']}/items/{pasta['item_id']}:"
+        f"/{quote(nome_arquivo)}:/content"
+    )
+    resp = requests.get(arquivo_url, headers=headers, timeout=90, allow_redirects=True)
+    if resp.status_code >= 400:
+        raise FileNotFoundError(f"Arquivo {nome_arquivo} não encontrado na pasta SharePoint ou sem permissão de leitura.")
+    return resp.content
+
+
+def arquivo_sharepoint_para_excel(folder_url, nome_arquivo, cfg):
+    conteudo = baixar_arquivo_sharepoint(
+        folder_url,
+        nome_arquivo,
+        cfg["tenant_id"],
+        cfg["client_id"],
+        cfg["client_secret"],
+    )
+    bio = BytesIO(conteudo)
+    bio.name = nome_arquivo
+    return bio
+
+
+def salvar_arquivo_sharepoint(folder_url, nome_arquivo, conteudo, cfg):
+    """Atualiza/cria arquivo dentro da pasta SharePoint. Exige permissão de escrita no Graph."""
+    pasta = resolver_pasta_sharepoint(folder_url, cfg["tenant_id"], cfg["client_id"], cfg["client_secret"])
+    token = obter_token_graph(cfg["tenant_id"], cfg["client_id"], cfg["client_secret"])
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+    upload_url = (
+        f"https://graph.microsoft.com/v1.0/drives/{pasta['drive_id']}/items/{pasta['item_id']}:"
+        f"/{quote(nome_arquivo)}:/content"
+    )
+    resp = requests.put(upload_url, headers=headers, data=conteudo, timeout=120)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Não consegui salvar {nome_arquivo} no SharePoint ({resp.status_code}).")
+    return resp.json()
+
+
+
+def resetar_fonte_excel(fonte):
+    """UploadedFile precisa de seek(0); caminho local do OneDrive não."""
+    if hasattr(fonte, "seek"):
+        fonte.seek(0)
+    return fonte
+
+
+def nome_fonte_excel(fonte):
+    if isinstance(fonte, (str, Path)):
+        return str(fonte)
+    return getattr(fonte, "name", "arquivo carregado")
+
+
 def gerar_datas_equipe(data_inicio, data_fim, equipe_idx, trabalhar_sabado_alternado=True):
     datas = []
     sabados = []
@@ -265,58 +466,57 @@ def site_pode_na_data(row, data_ref):
 
 
 def kpi_card(label, value, help_text=""):
-    # HTML em linha única evita que o Markdown do Streamlit interprete os cards seguintes como bloco de código.
-    return (
-        f'<div class="kpi-card">'
-        f'<div class="kpi-label">{label}</div>'
-        f'<div class="kpi-value">{value}</div>'
-        f'<div class="kpi-help">{help_text}</div>'
-        f'</div>'
-    )
+    return {"label": label, "value": value, "help_text": help_text}
 
 
 def render_kpis(cards):
-    html = '<div class="kpi-wrap">' + "".join(cards) + '</div>'
-    st.markdown(html, unsafe_allow_html=True)
+    cols = st.columns(len(cards))
+    for col, card in zip(cols, cards):
+        with col:
+            with st.container(border=True):
+                st.caption(card.get("label", ""))
+                st.markdown(f"### {card.get('value', '')}")
+                if card.get("help_text", ""):
+                    st.caption(card.get("help_text", ""))
 
 # =========================================================
 # LEITURA DOS ARQUIVOS
 # =========================================================
 def ler_lista_estacoes(file_lista):
-    file_lista.seek(0)
-    xl = pd.ExcelFile(file_lista)
+    fonte = resetar_fonte_excel(file_lista)
+    xl = pd.ExcelFile(fonte)
     sheet = "Planilha1" if "Planilha1" in xl.sheet_names else xl.sheet_names[0]
-    file_lista.seek(0)
-    return pd.read_excel(file_lista, sheet_name=sheet)
+    fonte = resetar_fonte_excel(file_lista)
+    return pd.read_excel(fonte, sheet_name=sheet)
 
 
 def ler_carga_toa(file_carga):
-    file_carga.seek(0)
-    xl = pd.ExcelFile(file_carga)
+    fonte = resetar_fonte_excel(file_carga)
+    xl = pd.ExcelFile(fonte)
 
     # A aba CLUSTER costuma trazer WO, mas com cabeçalho na segunda linha.
     if "CLUSTER" in xl.sheet_names:
-        file_carga.seek(0)
-        df_cluster = pd.read_excel(file_carga, sheet_name="CLUSTER", header=1)
+        fonte = resetar_fonte_excel(file_carga)
+        df_cluster = pd.read_excel(fonte, sheet_name="CLUSTER", header=1)
         if encontrar_coluna(df_cluster, ["WO", "W.O", "Ordem de Serviço"]) is not None:
             return df_cluster, "CLUSTER"
 
     sheet = "CARGA" if "CARGA" in xl.sheet_names else xl.sheet_names[0]
-    file_carga.seek(0)
-    return pd.read_excel(file_carga, sheet_name=sheet), sheet
+    fonte = resetar_fonte_excel(file_carga)
+    return pd.read_excel(fonte, sheet_name=sheet), sheet
 
 
 def ler_particularidades_acesso(file_acessos):
     if file_acessos is None:
         return pd.DataFrame(columns=["Sigla Site", "Particularidade_Acesso"])
 
-    file_acessos.seek(0)
-    xl = pd.ExcelFile(file_acessos)
+    fonte = resetar_fonte_excel(file_acessos)
+    xl = pd.ExcelFile(fonte)
     if "Particularidades dos sites" not in xl.sheet_names:
         return pd.DataFrame(columns=["Sigla Site", "Particularidade_Acesso"])
 
-    file_acessos.seek(0)
-    df = pd.read_excel(file_acessos, sheet_name="Particularidades dos sites")
+    fonte = resetar_fonte_excel(file_acessos)
+    df = pd.read_excel(fonte, sheet_name="Particularidades dos sites")
     registros = []
 
     for col in df.columns:
@@ -342,43 +542,46 @@ def ler_particularidades_acesso(file_acessos):
 def ler_cronograma_preventivas(file_cronograma):
     if file_cronograma is None:
         return pd.DataFrame()
-    file_cronograma.seek(0)
-    xl = pd.ExcelFile(file_cronograma)
+    fonte = resetar_fonte_excel(file_cronograma)
+    xl = pd.ExcelFile(fonte)
     sheet = "Cronograma" if "Cronograma" in xl.sheet_names else xl.sheet_names[0]
-    file_cronograma.seek(0)
-    return pd.read_excel(file_cronograma, sheet_name=sheet)
+    fonte = resetar_fonte_excel(file_cronograma)
+    return pd.read_excel(fonte, sheet_name=sheet)
 
 
 def ler_roteiro_congelado(file_roteiro):
-    """Lê um roteiro já exportado pelo robô para continuar acompanhamento em outro dia/sessão."""
+    """Lê um roteiro já exportado pelo robô para continuar acompanhamento em outro dia/sessão.
+    Aceita upload do Streamlit ou caminho local sincronizado no OneDrive.
+    """
     if file_roteiro is None:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    file_roteiro.seek(0)
-    xl = pd.ExcelFile(file_roteiro)
+
+    fonte = resetar_fonte_excel(file_roteiro)
+    xl = pd.ExcelFile(fonte)
 
     if "Programacao" in xl.sheet_names:
-        file_roteiro.seek(0)
-        programacao = pd.read_excel(file_roteiro, sheet_name="Programacao")
+        fonte = resetar_fonte_excel(file_roteiro)
+        programacao = pd.read_excel(fonte, sheet_name="Programacao")
     elif "Programação" in xl.sheet_names:
-        file_roteiro.seek(0)
-        programacao = pd.read_excel(file_roteiro, sheet_name="Programação")
+        fonte = resetar_fonte_excel(file_roteiro)
+        programacao = pd.read_excel(fonte, sheet_name="Programação")
     elif "Consolidado" in xl.sheet_names:
-        file_roteiro.seek(0)
-        consolidado = pd.read_excel(file_roteiro, sheet_name="Consolidado")
+        fonte = resetar_fonte_excel(file_roteiro)
+        consolidado = pd.read_excel(fonte, sheet_name="Consolidado")
         if "Origem" in consolidado.columns:
             programacao = consolidado[consolidado["Origem"].astype(str).str.contains("Program", case=False, na=False)].drop(columns=["Origem"], errors="ignore")
         else:
             programacao = consolidado.copy()
     else:
-        file_roteiro.seek(0)
-        programacao = pd.read_excel(file_roteiro, sheet_name=xl.sheet_names[0])
+        fonte = resetar_fonte_excel(file_roteiro)
+        programacao = pd.read_excel(fonte, sheet_name=xl.sheet_names[0])
 
     if "Backlog" in xl.sheet_names:
-        file_roteiro.seek(0)
-        backlog = pd.read_excel(file_roteiro, sheet_name="Backlog")
+        fonte = resetar_fonte_excel(file_roteiro)
+        backlog = pd.read_excel(fonte, sheet_name="Backlog")
     elif "Consolidado" in xl.sheet_names:
-        file_roteiro.seek(0)
-        consolidado = pd.read_excel(file_roteiro, sheet_name="Consolidado")
+        fonte = resetar_fonte_excel(file_roteiro)
+        consolidado = pd.read_excel(fonte, sheet_name="Consolidado")
         if "Origem" in consolidado.columns:
             backlog = consolidado[consolidado["Origem"].astype(str).str.contains("Backlog", case=False, na=False)].drop(columns=["Origem"], errors="ignore")
         else:
@@ -388,10 +591,24 @@ def ler_roteiro_congelado(file_roteiro):
 
     resumo = pd.DataFrame()
     if "Resumo Equipes" in xl.sheet_names:
-        file_roteiro.seek(0)
-        resumo = pd.read_excel(file_roteiro, sheet_name="Resumo Equipes")
+        fonte = resetar_fonte_excel(file_roteiro)
+        resumo = pd.read_excel(fonte, sheet_name="Resumo Equipes")
 
     return programacao, backlog, resumo
+
+
+def carregar_roteiro_em_sessao(fonte_roteiro, origem="Roteiro congelado/anterior"):
+    df_prog_ant, df_back_ant, df_res_ant = ler_roteiro_congelado(fonte_roteiro)
+    st.session_state["df_programacao"] = df_prog_ant
+    st.session_state["df_backlog"] = df_back_ant
+    st.session_state["df_resumo"] = df_res_ant
+    st.session_state["df_tasks"] = pd.concat([df_prog_ant, df_back_ant], ignore_index=True, sort=False) if not df_back_ant.empty else df_prog_ant.copy()
+    st.session_state["df_resumo_regiao"] = pd.DataFrame()
+    st.session_state["excel"] = gerar_excel_exportacao(df_prog_ant, df_back_ant, df_res_ant)
+    st.session_state["aba_carga"] = origem
+    st.session_state["roteiro_congelado_em"] = origem
+    st.session_state["fonte_roteiro_congelado"] = nome_fonte_excel(fonte_roteiro)
+
 
 # =========================================================
 # PREPARAÇÃO DAS BASES ORIGINAIS
@@ -1333,7 +1550,51 @@ def exibir_mapa_programacao(df_programacao):
 # SIDEBAR / ENTRADAS
 # =========================================================
 with st.sidebar:
-    st.header("📂 Arquivos do cliente")
+    st.header("📌 Dashboard congelado")
+    origem_dashboard = st.radio(
+        "Onde estão as bases oficiais?",
+        ["SharePoint/OneDrive online", "Pasta sincronizada/local", "Vou carregar manualmente"],
+        index=0,
+    )
+
+    usar_sharepoint_online = origem_dashboard == "SharePoint/OneDrive online"
+    usar_onedrive = origem_dashboard == "Pasta sincronizada/local"
+    cfg_sharepoint = obter_config_sharepoint()
+
+    if usar_sharepoint_online:
+        pasta_sharepoint_url = st.text_area(
+            "Link da pasta SharePoint/OneDrive",
+            value=cfg_sharepoint.get("folder_url") or PASTA_SHAREPOINT_URL_PADRAO,
+            height=90,
+            help="Mantenha nessa pasta os arquivos roteiro_atual.xlsx e cronograma_atual.xlsx.",
+        )
+        salvar_roteiro_onedrive = st.checkbox("Ao gerar novo roteiro, atualizar roteiro_atual.xlsx no SharePoint", value=True)
+        if not sharepoint_config_ok(cfg_sharepoint):
+            st.warning("Para carregar direto do SharePoint online, cadastre as credenciais do Microsoft Graph em Secrets.")
+    elif usar_onedrive:
+        caminho_roteiro_onedrive = st.text_input(
+            "Pasta dos arquivos oficiais",
+            value=PASTA_ONEDRIVE_PADRAO,
+            placeholder=r"C:\Users\SeuUsuario\OneDrive - Empresa\Roteiros",
+            help="Deixe nessa pasta os arquivos roteiro_atual.xlsx e cronograma_atual.xlsx.",
+        )
+        caminho_cronograma_onedrive = st.text_input(
+            "Cronograma atual (opcional)",
+            value="",
+            placeholder="Deixe vazio para buscar cronograma_atual.xlsx na mesma pasta",
+            help="Use apenas se o cronograma estiver em outra pasta ou com outro nome.",
+        )
+        salvar_roteiro_onedrive = st.checkbox("Ao gerar novo roteiro, salvar como roteiro_atual.xlsx", value=True)
+        caminho_roteiro_onedrive_resolvido = resolver_com_fallback(caminho_roteiro_onedrive, NOME_ROTEIRO_PADRAO)
+        caminho_cronograma_base = caminho_cronograma_onedrive if limpar_caminho_arquivo(caminho_cronograma_onedrive) else caminho_roteiro_onedrive
+        caminho_cronograma_onedrive_resolvido = resolver_com_fallback(caminho_cronograma_base, NOME_CRONOGRAMA_PADRAO)
+    else:
+        pasta_sharepoint_url = ""
+        caminho_roteiro_onedrive_resolvido = ""
+        caminho_cronograma_onedrive_resolvido = ""
+        salvar_roteiro_onedrive = False
+    st.divider()
+    st.header("📂 Nova roteirização")
     file_lista = st.file_uploader("Lista de Estações", type=["xlsx", "xls"], key="lista_estacoes")
     file_carga = st.file_uploader("Carga TOA", type=["xlsx", "xls"], key="carga_toa")
     file_acessos = st.file_uploader("Base Acessos", type=["xlsx", "xls"], key="base_acessos")
@@ -1369,14 +1630,56 @@ with st.sidebar:
     st.divider()
     st.header("📌 Acompanhamento")
     file_cronograma = st.file_uploader("Cronograma Preventivas / base realizada", type=["xlsx", "xls"], key="cronograma_execucao")
-    file_roteiro_congelado = st.file_uploader("Roteiro congelado/anterior (opcional)", type=["xlsx", "xls"], key="roteiro_congelado_upload", help="Use quando você fechou o app e quer acompanhar uma roteirização gerada anteriormente.")
+    file_roteiro_congelado = st.file_uploader("Roteiro atual/anterior (opcional)", type=["xlsx", "xls"], key="roteiro_congelado_upload", help="Use somente se quiser carregar um roteiro diferente do roteiro_atual.xlsx.")
     data_apuracao = st.date_input("Apurar realizado até", hoje)
+
+# =========================================================
+# CARREGAMENTO AUTOMÁTICO PELO ONEDRIVE
+# =========================================================
+fonte_cronograma_execucao = file_cronograma
+
+if usar_sharepoint_online and fonte_cronograma_execucao is None and sharepoint_config_ok(cfg_sharepoint):
+    try:
+        fonte_cronograma_execucao = arquivo_sharepoint_para_excel(pasta_sharepoint_url, NOME_CRONOGRAMA_PADRAO, cfg_sharepoint)
+    except Exception as e:
+        st.sidebar.caption(f"Cronograma atual não carregado do SharePoint: {e}")
+elif usar_onedrive and fonte_cronograma_execucao is None and caminho_cronograma_onedrive_resolvido:
+    if Path(caminho_cronograma_onedrive_resolvido).exists():
+        fonte_cronograma_execucao = caminho_cronograma_onedrive_resolvido
+    else:
+        st.sidebar.caption("Cronograma atual não encontrado automaticamente.")
+
+if "df_programacao" not in st.session_state:
+    if usar_sharepoint_online and sharepoint_config_ok(cfg_sharepoint):
+        try:
+            fonte_roteiro_sp = arquivo_sharepoint_para_excel(pasta_sharepoint_url, NOME_ROTEIRO_PADRAO, cfg_sharepoint)
+            carregar_roteiro_em_sessao(fonte_roteiro_sp, origem="SharePoint: roteiro atual")
+            st.success("Roteiro atual carregado automaticamente do SharePoint.")
+        except Exception as e:
+            st.sidebar.info(f"Roteiro atual não carregado do SharePoint: {e}")
+    elif usar_onedrive and caminho_roteiro_onedrive_resolvido:
+        if Path(caminho_roteiro_onedrive_resolvido).exists():
+            try:
+                carregar_roteiro_em_sessao(caminho_roteiro_onedrive_resolvido, origem="Roteiro atual carregado automaticamente")
+                st.success("Roteiro atual carregado automaticamente.")
+            except Exception as e:
+                st.warning(f"Encontrei o roteiro atual, mas não consegui carregar: {e}")
+        else:
+            st.sidebar.info("Roteiro atual não encontrado automaticamente. Gere um novo roteiro ou ajuste a pasta.")
 
 # =========================================================
 # EXECUÇÃO DA ROTEIRIZAÇÃO
 # =========================================================
 if file_lista and file_carga:
-    st.markdown('<div class="section-card"><b>Pronto para gerar.</b><br><span class="muted">O robô vai filtrar UF = SPC, escopo MÓVEL e/ou ERIC, excluir TIPO 0/MRB, manter somente Climatização/Energia, respeitar acesso/polesite após dia 10, priorizar GPON/Estratégico dentro da região e exportar no padrão do roteiro.</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="section-card">
+            <div style="font-size:1.15rem; font-weight:850;">Base carregada para planejamento</div>
+            <div class="muted">Desenvolvido pelo PCP • Uso interno do contrato INFRA CLARO SPC • Preparado para gerar o roteiro móvel e atualizar o dashboard operacional.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if st.button("🚀 Gerar roteiro móvel", type="primary", use_container_width=True):
         try:
@@ -1389,7 +1692,7 @@ if file_lista and file_carga:
             df_acessos = ler_particularidades_acesso(file_acessos) if file_acessos else pd.DataFrame(columns=["Sigla Site", "Particularidade_Acesso"])
             progress.progress(20)
 
-            status.info("Preparando bases e aplicando filtros: UF = SPC + MÓVEL/ERIC + Clima/Energia...")
+            status.info("Preparando bases e identificando os sites elegíveis para programação...")
             df_tasks = preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao)
             progress.progress(45)
 
@@ -1407,7 +1710,7 @@ if file_lista and file_carga:
             )
             progress.progress(75)
 
-            status.info("Formatando saída no padrão do roteiro e congelando a programação...")
+            status.info("Formatando o roteiro e atualizando o dashboard...")
             df_programacao = formatar_saida(prog_raw, int(cap_dia), backlog=False)
             df_backlog = formatar_saida(backlog_raw, int(cap_dia), backlog=True)
             df_resumo = montar_resumo_equipes(slots, df_programacao)
@@ -1423,27 +1726,38 @@ if file_lista and file_carga:
             st.session_state["excel"] = excel
             st.session_state["aba_carga"] = aba_carga
             st.session_state["roteiro_congelado_em"] = datetime.now().strftime("%d/%m/%Y %H:%M")
-            st.success("Roteiro gerado e congelado com sucesso!")
+
+            if salvar_roteiro_onedrive:
+                try:
+                    if usar_sharepoint_online:
+                        salvar_arquivo_sharepoint(pasta_sharepoint_url, NOME_ROTEIRO_PADRAO, excel, cfg_sharepoint)
+                        st.session_state["fonte_roteiro_congelado"] = "SharePoint: roteiro_atual.xlsx"
+                        st.success("Roteiro gerado e salvo como roteiro_atual.xlsx no SharePoint.")
+                    elif usar_onedrive and caminho_roteiro_onedrive_resolvido:
+                        destino = Path(caminho_roteiro_onedrive_resolvido)
+                        destino.parent.mkdir(parents=True, exist_ok=True)
+                        destino.write_bytes(excel)
+                        st.session_state["fonte_roteiro_congelado"] = str(destino)
+                        st.success(f"Roteiro atualizado e salvo como roteiro_atual.xlsx: {destino}")
+                    else:
+                        st.success("Roteiro gerado e congelado com sucesso!")
+                except Exception as e:
+                    st.warning(f"Roteiro gerado, mas não consegui salvar como roteiro_atual.xlsx: {e}")
+            else:
+                st.success("Roteiro gerado e congelado com sucesso!")
 
         except Exception as e:
             st.error(f"Erro ao gerar roteiro: {e}")
 else:
-    st.info("Suba a Lista de Estações e a Carga TOA para liberar a geração. A Base Acessos é opcional, mas recomendada.")
+    if "df_programacao" not in st.session_state:
+        st.info("Para gerar um novo roteiro, carregue a Lista de Estações e a Carga TOA. Para acompanhamento, mantenha roteiro_atual.xlsx e cronograma_atual.xlsx na pasta oficial do SharePoint/OneDrive.")
 
 # =========================================================
 # CARREGAMENTO DE ROTEIRO CONGELADO/ANTERIOR
 # =========================================================
 if "df_programacao" not in st.session_state and file_roteiro_congelado is not None:
     try:
-        df_prog_ant, df_back_ant, df_res_ant = ler_roteiro_congelado(file_roteiro_congelado)
-        st.session_state["df_programacao"] = df_prog_ant
-        st.session_state["df_backlog"] = df_back_ant
-        st.session_state["df_resumo"] = df_res_ant
-        st.session_state["df_tasks"] = pd.concat([df_prog_ant, df_back_ant], ignore_index=True, sort=False) if not df_back_ant.empty else df_prog_ant.copy()
-        st.session_state["df_resumo_regiao"] = pd.DataFrame()
-        st.session_state["excel"] = gerar_excel_exportacao(df_prog_ant, df_back_ant, df_res_ant)
-        st.session_state["aba_carga"] = "Roteiro congelado/anterior"
-        st.session_state["roteiro_congelado_em"] = "Carregado de arquivo"
+        carregar_roteiro_em_sessao(file_roteiro_congelado, origem="Roteiro congelado/anterior carregado por upload")
         st.success("Roteiro congelado/anterior carregado para acompanhamento.")
     except Exception as e:
         st.error(f"Não consegui carregar o roteiro congelado/anterior: {e}")
@@ -1466,19 +1780,19 @@ if "df_programacao" in st.session_state:
     pct_prog = (programados / total_roteirizavel * 100) if total_roteirizavel else 0
 
     render_kpis([
-        kpi_card("Sites roteirizáveis", f"{total_roteirizavel:,}".replace(",", "."), "Após filtros: SPC + Móvel/ERIC - Tipo 0/MRB + Clima/Energia"),
-        kpi_card("Sites programados", f"{programados:,}".replace(",", "."), f"{pct_prog:.1f}% do escopo filtrado".replace(".", ",")),
-        kpi_card("Sites sem programação", f"{backlog:,}".replace(",", "."), "Entraram no backlog"),
+        kpi_card("Sites roteirizáveis", f"{total_roteirizavel:,}".replace(",", "."), "Escopo validado para programação"),
+        kpi_card("Sites programados", f"{programados:,}".replace(",", "."), f"{pct_prog:.1f}% do escopo".replace(".", ",")),
+        kpi_card("Sites pendentes", f"{backlog:,}".replace(",", "."), "Necessitam reprogramação ou ajuste operacional"),
         kpi_card("Peso programado", f"{peso_programado:,}".replace(",", "."), f"{particularidade} com particularidade de acesso"),
     ])
 
-    st.caption(f"Carga TOA lida pela aba: {st.session_state.get('aba_carga', '')} | Roteirização congelada em: {st.session_state.get('roteiro_congelado_em', '')}")
+    st.caption(f"Fonte da carga: {st.session_state.get('aba_carga', '')} | Última atualização do roteiro: {st.session_state.get('roteiro_congelado_em', '')}")
 
     df_acomp = df_realizados = df_perdidos = df_reprogramar = df_resumo_exec = pd.DataFrame()
     excel_acomp = None
-    if file_cronograma is not None:
+    if fonte_cronograma_execucao is not None:
         try:
-            df_cronograma = ler_cronograma_preventivas(file_cronograma)
+            df_cronograma = ler_cronograma_preventivas(fonte_cronograma_execucao)
             df_acomp, df_realizados, df_perdidos, df_reprogramar, df_resumo_exec = avaliar_execucao(
                 df_programacao,
                 df_backlog,
@@ -1497,7 +1811,7 @@ if "df_programacao" in st.session_state:
                 kpi_card("Realizados", f"{len(df_realizados):,}".replace(",", "."), "Programados que constam como 100%/executados"),
                 kpi_card("Perdidos", f"{len(df_perdidos):,}".replace(",", "."), "Programados até a apuração e não realizados"),
                 kpi_card("Reprogramar", f"{len(df_reprogramar):,}".replace(",", "."), "Perdidos + backlog original"),
-                kpi_card("Data apuração", pd.Timestamp(data_apuracao).strftime("%d/%m"), "Base de execução carregada"),
+                kpi_card("Data apuração", pd.Timestamp(data_apuracao).strftime("%d/%m"), f"Base: {Path(nome_fonte_excel(fonte_cronograma_execucao)).name}"),
             ])
         except Exception as e:
             st.warning(f"Não consegui cruzar a base realizada ainda: {e}")
@@ -1528,7 +1842,7 @@ if "df_programacao" in st.session_state:
                 use_container_width=True,
             )
         else:
-            st.info("Suba o Cronograma Preventivas na barra lateral para atualizar realizado, perdido e reprogramação contra a última roteirização congelada.")
+            st.info("Para atualizar o acompanhamento, mantenha o arquivo cronograma_atual.xlsx na pasta oficial do SharePoint/OneDrive ou carregue a base realizada manualmente.")
     with tab5:
         st.subheader("Resumo por equipe")
         st.dataframe(df_resumo, use_container_width=True, hide_index=True)
@@ -1539,9 +1853,9 @@ if "df_programacao" in st.session_state:
         st.dataframe(df_tasks, use_container_width=True, hide_index=True)
 
     st.download_button(
-        "📥 Baixar Excel Completo do Roteiro",
+        "📥 Baixar roteiro_atual.xlsx",
         st.session_state["excel"],
-        file_name="roteiro_movel_planejado_v6.xlsx",
+        file_name="roteiro_atual.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )

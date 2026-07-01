@@ -6,7 +6,7 @@ from io import BytesIO
 import unicodedata
 import re
 
-VERSAO_APP = "ROTEIRIZADOR_MOVEL_V4_2026_07"
+VERSAO_APP = "ROTEIRIZADOR_MOVEL_V5_2026_07"
 
 # =========================================================
 # CONFIGURAÇÃO VISUAL
@@ -243,14 +243,46 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
     df_lista = df_lista.loc[:, ~df_lista.columns.duplicated()].copy()
     df_carga = df_carga.loc[:, ~df_carga.columns.duplicated()].copy()
 
+    # Regra atual de escopo móvel:
+    # 1) Tudo que na Lista de Estações está como MÓVEL na unidade responsável; OU
+    # 2) Tudo que está com ERIC na equipe responsável.
     col_unidade = encontrar_coluna(df_lista, ["UNIDADE_RESPONSAVEL", "UNIDADE RESPONSAVEL", "UNIDADE_RESPONSÁVEL"], contem=["UNIDADE"])
-    if col_unidade is None:
-        raise ValueError("Não encontrei a coluna UNIDADE_RESPONSAVEL na Lista de Estações.")
+    col_equipe_resp = encontrar_coluna(df_lista, ["EQUIPE RESPONSÁVEL", "EQUIPE RESPONSAVEL", "EQUIPE_RESPONSAVEL"], contem=["EQUIPERESPONS"])
 
-    df_lista[col_unidade] = df_lista[col_unidade].apply(normalizar_valor)
-    df_lista = df_lista[df_lista[col_unidade].str.contains("MOVEL", na=False)].copy()
+    if col_unidade is None and col_equipe_resp is None:
+        raise ValueError("Não encontrei UNIDADE_RESPONSAVEL nem EQUIPE RESPONSÁVEL na Lista de Estações para aplicar a regra de Móvel/ERIC.")
+
+    mask_movel = pd.Series(False, index=df_lista.index)
+    mask_eric = pd.Series(False, index=df_lista.index)
+
+    if col_unidade is not None:
+        unidade_norm = df_lista[col_unidade].apply(normalizar_valor)
+        mask_movel = unidade_norm.str.contains("MOVEL", na=False)
+
+    if col_equipe_resp is not None:
+        equipe_norm = df_lista[col_equipe_resp].apply(normalizar_valor)
+        mask_eric = equipe_norm.str.contains("ERIC", na=False)
+
+    df_lista["Regra_Escopo_Movel"] = np.select(
+        [mask_movel & mask_eric, mask_movel, mask_eric],
+        ["MÓVEL + ERIC", "MÓVEL", "ERIC"],
+        default="FORA DO ESCOPO",
+    )
+    df_lista = df_lista[mask_movel | mask_eric].copy()
+
     if df_lista.empty:
-        raise ValueError("Depois do filtro de unidade MÓVEL, a Lista de Estações ficou vazia.")
+        raise ValueError("Depois do filtro MÓVEL e/ou ERIC, a Lista de Estações ficou vazia.")
+
+    # A Carga TOA deve considerar somente UF = SPC.
+    col_uf_carga = encontrar_coluna(df_carga, ["UF", "Regional", "REGIONAL"])
+    if col_uf_carga is None:
+        raise ValueError("Não encontrei a coluna UF na Carga TOA. Para esta versão, o robô precisa filtrar UF = SPC.")
+
+    df_carga[col_uf_carga] = df_carga[col_uf_carga].apply(normalizar_valor)
+    df_carga = df_carga[df_carga[col_uf_carga].eq("SPC")].copy()
+
+    if df_carga.empty:
+        raise ValueError("Depois do filtro UF = SPC, a Carga TOA ficou vazia.")
 
     col_area = encontrar_coluna(df_lista, ["AREA", "ÁREA"])
     col_micro = encontrar_coluna(df_lista, ["MICRO_REGIAO", "MICRO REGIAO", "MICRO_REGIÃO"])
@@ -327,6 +359,19 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
 
     df_missoes = df_missoes.merge(df_wo[["Sigla Site", "WO_Climatizacao", "WO_Energia_Eletrica"]], on="Sigla Site", how="left")
 
+    # Quando a carga vem com "Abrir manual" no campo WO, isso não significa que
+    # o site deixou de ser programado; significa que a WO ainda não veio numerada
+    # e precisa de abertura/regularização manual na Claro.
+    def montar_observacao_wo(row):
+        obs = []
+        if "ABRIR MANUAL" in normalizar_valor(row.get("WO_Climatizacao", "")):
+            obs.append("Clima: abrir manual")
+        if "ABRIR MANUAL" in normalizar_valor(row.get("WO_Energia_Eletrica", "")):
+            obs.append("Energia: abrir manual")
+        return " | ".join(obs)
+
+    df_missoes["Observacao_WO_Carga"] = df_missoes.apply(montar_observacao_wo, axis=1)
+
     df_roteiro = df_missoes.merge(df_site_lookup, on="Sigla Site", how="inner").copy()
     df_roteiro = df_roteiro.drop_duplicates(subset=["Sigla Site"]).copy()
 
@@ -363,7 +408,16 @@ def construir_equipes(qtd_equipes):
     })
 
 
-def atribuir_regioes_para_equipes(df_tasks, qtd_equipes):
+def calcular_capacidade_equipes(qtd_equipes, data_inicio, data_fim, cap_dia, sabado_alternado):
+    capacidades = {}
+    for eq_idx in range(1, int(qtd_equipes) + 1):
+        equipe = f"Equipe {eq_idx:02d}"
+        datas = gerar_datas_equipe(data_inicio, data_fim, eq_idx, sabado_alternado)
+        capacidades[equipe] = max(1, len(datas) * int(cap_dia))
+    return capacidades
+
+
+def atribuir_regioes_para_equipes(df_tasks, qtd_equipes, capacidade_equipes=None):
     equipes = construir_equipes(qtd_equipes)
     resumo_regiao = (
         df_tasks.groupby("Regiao_Roteiro", as_index=False)
@@ -377,16 +431,40 @@ def atribuir_regioes_para_equipes(df_tasks, qtd_equipes):
         .sort_values(["Peso_Total", "Qtd_Sites"], ascending=[False, False])
     )
 
-    carga_equipes = {eq: 0 for eq in equipes["Equipe"]}
+    if capacidade_equipes is None:
+        capacidade_equipes = {eq: 1 for eq in equipes["Equipe"]}
+
+    carga_equipes = {eq: 0.0 for eq in equipes["Equipe"]}
+    qtd_regioes_equipes = {eq: 0 for eq in equipes["Equipe"]}
     mapa = {}
+
     for _, reg in resumo_regiao.iterrows():
-        equipe_escolhida = min(carga_equipes, key=carga_equipes.get)
+        peso_regiao = float(reg["Peso_Total"])
+
+        # Escolhe a equipe que ficará mais equilibrada depois de receber esta região.
+        # Isso mantém a regra de não quebrar região entre equipes, mas evita concentrar
+        # regiões pesadas em poucas equipes.
+        equipe_escolhida = min(
+            carga_equipes.keys(),
+            key=lambda eq: (
+                (carga_equipes[eq] + peso_regiao) / max(1, capacidade_equipes.get(eq, 1)),
+                carga_equipes[eq],
+                qtd_regioes_equipes[eq],
+                eq,
+            ),
+        )
+
         mapa[reg["Regiao_Roteiro"]] = equipe_escolhida
-        carga_equipes[equipe_escolhida] += int(reg["Peso_Total"])
+        carga_equipes[equipe_escolhida] += peso_regiao
+        qtd_regioes_equipes[equipe_escolhida] += 1
 
     df = df_tasks.copy()
     df["Equipe"] = df["Regiao_Roteiro"].map(mapa)
     df["Tecnico"] = df["Equipe"]
+    df["Carga_Equipe_Prevista"] = df["Equipe"].map(carga_equipes).fillna(0)
+    df["Capacidade_Equipe_Prevista"] = df["Equipe"].map(capacidade_equipes).fillna(0)
+
+    resumo_regiao["Equipe_Atribuida"] = resumo_regiao["Regiao_Roteiro"].map(mapa)
     return df, resumo_regiao, mapa
 
 
@@ -458,7 +536,8 @@ def montar_dia_rota(pendentes, data_ref, cap_dia, max_km_dia, priorizar_greenfie
 
 
 def roteirizar(df_tasks, qtd_equipes, data_inicio, data_fim, cap_dia, max_km_dia, priorizar_greenfield_ate, sabado_alternado):
-    df_tasks, resumo_regiao, mapa_regioes = atribuir_regioes_para_equipes(df_tasks, qtd_equipes)
+    capacidade_equipes = calcular_capacidade_equipes(qtd_equipes, data_inicio, data_fim, cap_dia, sabado_alternado)
+    df_tasks, resumo_regiao, mapa_regioes = atribuir_regioes_para_equipes(df_tasks, qtd_equipes, capacidade_equipes)
 
     programados = []
     slots = []
@@ -579,7 +658,9 @@ def formatar_saida(df, cap_dia, backlog=False):
         "longitude",
         "Regiao_Roteiro",
         "ID_Site_Main",
+        "Regra_Escopo_Movel",
         "Particularidade_Acesso",
+        "Observacao_WO_Carga",
     ]
     for c in colunas:
         if c not in df.columns:
@@ -685,7 +766,7 @@ with st.sidebar:
 # EXECUÇÃO
 # =========================================================
 if file_lista and file_carga:
-    st.markdown('<div class="section-card"><b>Pronto para gerar.</b><br><span class="muted">O robô vai filtrar somente MÓVEL, somente Climatização/Energia, agrupar por região e exportar no padrão do roteiro.</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-card"><b>Pronto para gerar.</b><br><span class="muted">O robô vai filtrar UF = SPC, escopo MÓVEL e/ou ERIC, somente Climatização/Energia, agrupar por região e exportar no padrão do roteiro.</span></div>', unsafe_allow_html=True)
 
     if st.button("🚀 Gerar roteiro móvel", type="primary", use_container_width=True):
         try:
@@ -698,7 +779,7 @@ if file_lista and file_carga:
             df_acessos = ler_particularidades_acesso(file_acessos) if file_acessos else pd.DataFrame(columns=["Sigla Site", "Particularidade_Acesso"])
             progress.progress(20)
 
-            status.info("Preparando bases e aplicando filtros: MÓVEL + Clima/Energia...")
+            status.info("Preparando bases e aplicando filtros: UF = SPC + MÓVEL/ERIC + Clima/Energia...")
             df_tasks = preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao)
             progress.progress(45)
 

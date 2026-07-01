@@ -5,8 +5,9 @@ from datetime import datetime, timedelta
 from io import BytesIO
 import unicodedata
 import re
+import pydeck as pdk
 
-VERSAO_APP = "ROTEIRIZADOR_MOVEL_V5_2026_07"
+VERSAO_APP = "ROTEIRIZADOR_MOVEL_V6_DASH_ACOMPANHAMENTO"
 
 # =========================================================
 # CONFIGURAÇÃO VISUAL
@@ -16,13 +17,34 @@ st.set_page_config(page_title="Roteirizador Móvel", page_icon="📍", layout="w
 st.markdown(
     """
     <style>
-        .main .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-        .app-title {font-size: 2.0rem; font-weight: 800; color: #0B1F3A; margin-bottom: 0.1rem;}
-        .app-subtitle {font-size: 0.98rem; color: #5B667A; margin-bottom: 1.2rem;}
-        div[data-testid="stMetric"] {background: #FFFFFF; border: 1px solid #E5E7EB; padding: 14px 16px; border-radius: 16px; box-shadow: 0 1px 8px rgba(15, 23, 42, 0.04);}
-        .section-card {background: linear-gradient(135deg, #F8FBFF 0%, #FFFFFF 100%); border: 1px solid #E8EEF8; border-radius: 18px; padding: 18px 20px; margin-bottom: 14px;}
-        .muted {color: #64748B; font-size: 0.92rem;}
-        .success-pill {display:inline-block; padding:4px 10px; border-radius:999px; background:#E8F7EF; color:#166534; font-weight:700; font-size:0.78rem;}
+        .main .block-container {padding-top: 1.1rem; padding-bottom: 2rem;}
+        .app-title {font-size: 2.0rem; font-weight: 850; color: #EAF2FF; margin-bottom: 0.1rem;}
+        .app-subtitle {font-size: 0.98rem; color: #B7C3D7; margin-bottom: 1.2rem;}
+        .section-card {
+            background: linear-gradient(135deg, rgba(15, 23, 42, .92) 0%, rgba(30, 41, 59, .92) 100%);
+            border: 1px solid rgba(148, 163, 184, .22);
+            border-radius: 18px;
+            padding: 18px 20px;
+            margin-bottom: 14px;
+            color: #EAF2FF;
+        }
+        .muted {color: #A8B4C7; font-size: 0.92rem;}
+        .kpi-wrap {display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin: 10px 0 14px 0;}
+        .kpi-card {
+            background: linear-gradient(135deg, #FFFFFF 0%, #F5F8FF 100%);
+            border: 1px solid #D8E3F5;
+            border-radius: 18px;
+            padding: 16px 18px;
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+            min-height: 92px;
+        }
+        .kpi-label {color: #46556D !important; font-size: 0.82rem; font-weight: 750; letter-spacing: .01em; margin-bottom: 8px;}
+        .kpi-value {color: #0B1F3A !important; font-size: 2.05rem; font-weight: 850; line-height: 1;}
+        .kpi-help {color: #64748B !important; font-size: 0.78rem; margin-top: 7px;}
+        .legend-pill {display:inline-flex; align-items:center; gap:6px; padding:4px 8px; border-radius:999px; background:#F8FAFC; color:#0F172A; margin:3px 4px 3px 0; border:1px solid #E2E8F0; font-size:0.78rem;}
+        .dot {display:inline-block; width:10px; height:10px; border-radius:50%;}
+        @media (max-width: 1000px) {.kpi-wrap {grid-template-columns: repeat(2, minmax(0, 1fr));}}
+        @media (max-width: 620px) {.kpi-wrap {grid-template-columns: 1fr;}}
     </style>
     """,
     unsafe_allow_html=True,
@@ -30,7 +52,7 @@ st.markdown(
 
 st.markdown('<div class="app-title">📍 Roteirizador Móvel</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="app-subtitle">Programação automática por região, usando os arquivos originais: Lista de Estações, Carga TOA e Base de Acessos.</div>',
+    '<div class="app-subtitle">Programação automática por bairro/região, mapa diário por equipe e acompanhamento do realizado.</div>',
     unsafe_allow_html=True,
 )
 st.caption(f"Versão carregada: {VERSAO_APP}")
@@ -57,6 +79,16 @@ def normalizar_site(valor):
     if texto.endswith(".0"):
         texto = texto[:-2]
     texto = texto.replace("STATION ", "").strip()
+    return texto
+
+
+def normalizar_wo(valor):
+    texto = normalizar_valor(valor)
+    if texto.endswith(".0"):
+        texto = texto[:-2]
+    texto = texto.replace(" ", "")
+    if texto in {"", "NAN", "NONE", "NULL", "NAT", "ABRIRMANUAL"}:
+        return ""
     return texto
 
 
@@ -137,26 +169,91 @@ def peso_slots_visita(detalhe):
     return 2 if "DUPLA" in str(detalhe).upper() else 1
 
 
-def ler_planilha_excel(uploaded_file, sheet_preferida=None, header=0):
-    if uploaded_file is None:
-        return None
-    nome = uploaded_file.name.lower()
-    uploaded_file.seek(0)
-    if nome.endswith(".csv"):
-        try:
-            return pd.read_csv(uploaded_file)
-        except Exception:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, sep=";", encoding="latin1")
-    uploaded_file.seek(0)
-    if sheet_preferida:
-        xl = pd.ExcelFile(uploaded_file)
-        sheet = sheet_preferida if sheet_preferida in xl.sheet_names else xl.sheet_names[0]
-        uploaded_file.seek(0)
-        return pd.read_excel(uploaded_file, sheet_name=sheet, header=header)
-    return pd.read_excel(uploaded_file, header=header)
+def extrair_bairro_endereco(endereco):
+    """Tenta extrair bairro do padrão: LOGRADOURO - NÚMERO - BAIRRO - CEP."""
+    if pd.isna(endereco):
+        return ""
+    txt = str(endereco).replace("\n", " ").strip()
+    txt = re.sub(r"\s+", " ", txt)
+    if not txt:
+        return ""
+
+    partes = [p.strip(" ,.;") for p in re.split(r"\s+-\s+", txt) if str(p).strip(" ,.;")]
+    candidatos = []
+    for p in partes:
+        p_norm = normalizar_valor(p)
+        if not p_norm:
+            continue
+        if re.fullmatch(r"\d{5}-?\d{3}", p_norm):
+            continue
+        if re.fullmatch(r"\d+", p_norm):
+            continue
+        if p_norm in {"S/N", "SN", "S N"}:
+            continue
+        candidatos.append(p_norm)
+
+    # No padrão comum, o bairro é o último texto antes do CEP.
+    if len(candidatos) >= 2:
+        bairro = candidatos[-1]
+        # Evita retornar o próprio logradouro se só sobrou a rua.
+        if not any(bairro.startswith(prefixo) for prefixo in ["R ", "RUA ", "AV ", "AVENIDA ", "ROD ", "RODOVIA ", "ESTRADA "]):
+            return bairro
+
+    # Fallback: tenta pegar texto imediatamente antes do CEP.
+    cep_match = re.search(r"(.+?)\s*-\s*\d{5}-?\d{3}\s*$", txt)
+    if cep_match:
+        trecho = cep_match.group(1)
+        partes2 = [normalizar_valor(p) for p in re.split(r"\s+-\s+", trecho) if normalizar_valor(p)]
+        partes2 = [p for p in partes2 if not re.fullmatch(r"\d+", p)]
+        if partes2:
+            return partes2[-1]
+
+    return ""
 
 
+def formatar_data_br(valor):
+    try:
+        return pd.to_datetime(valor, errors="coerce", dayfirst=True).strftime("%d/%m/%Y")
+    except Exception:
+        return ""
+
+
+def gerar_datas_equipe(data_inicio, data_fim, equipe_idx, trabalhar_sabado_alternado=True):
+    datas = []
+    sabados = []
+    for d in pd.date_range(data_inicio, data_fim, freq="D"):
+        if d.weekday() <= 4:
+            datas.append(pd.Timestamp(d))
+        elif d.weekday() == 5 and trabalhar_sabado_alternado:
+            sabados.append(pd.Timestamp(d))
+
+    # Sábado sim / sábado não: equipes ímpares no primeiro sábado, pares no segundo, alternando.
+    for pos, sab in enumerate(sabados):
+        grupo_sabado = pos % 2
+        grupo_equipe = (equipe_idx - 1) % 2
+        if grupo_sabado == grupo_equipe:
+            datas.append(sab)
+
+    return sorted(datas)
+
+
+def kpi_card(label, value, help_text=""):
+    return f"""
+    <div class="kpi-card">
+        <div class="kpi-label">{label}</div>
+        <div class="kpi-value">{value}</div>
+        <div class="kpi-help">{help_text}</div>
+    </div>
+    """
+
+
+def render_kpis(cards):
+    html = '<div class="kpi-wrap">' + "".join(cards) + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+# =========================================================
+# LEITURA DOS ARQUIVOS
+# =========================================================
 def ler_lista_estacoes(file_lista):
     file_lista.seek(0)
     xl = pd.ExcelFile(file_lista)
@@ -176,7 +273,6 @@ def ler_carga_toa(file_carga):
         if encontrar_coluna(df_cluster, ["WO", "W.O", "Ordem de Serviço"]) is not None:
             return df_cluster, "CLUSTER"
 
-    # Fallback: aba CARGA, que normalmente não tem WO, mas tem site e tipo preventiva.
     sheet = "CARGA" if "CARGA" in xl.sheet_names else xl.sheet_names[0]
     file_carga.seek(0)
     return pd.read_excel(file_carga, sheet_name=sheet), sheet
@@ -211,30 +307,63 @@ def ler_particularidades_acesso(file_acessos):
         return pd.DataFrame(columns=["Sigla Site", "Particularidade_Acesso"])
 
     saida = pd.DataFrame(registros).drop_duplicates()
-    saida = (
-        saida.groupby("Sigla Site", as_index=False)["Particularidade_Acesso"]
-        .apply(juntar_unicos_sem_vazio)
-    )
+    saida = saida.groupby("Sigla Site", as_index=False)["Particularidade_Acesso"].apply(juntar_unicos_sem_vazio)
     return saida
 
 
-def gerar_datas_equipe(data_inicio, data_fim, equipe_idx, trabalhar_sabado_alternado=True):
-    datas = []
-    sabados = []
-    for d in pd.date_range(data_inicio, data_fim, freq="D"):
-        if d.weekday() <= 4:
-            datas.append(pd.Timestamp(d))
-        elif d.weekday() == 5 and trabalhar_sabado_alternado:
-            sabados.append(pd.Timestamp(d))
+def ler_cronograma_preventivas(file_cronograma):
+    if file_cronograma is None:
+        return pd.DataFrame()
+    file_cronograma.seek(0)
+    xl = pd.ExcelFile(file_cronograma)
+    sheet = "Cronograma" if "Cronograma" in xl.sheet_names else xl.sheet_names[0]
+    file_cronograma.seek(0)
+    return pd.read_excel(file_cronograma, sheet_name=sheet)
 
-    # Sábado sim / sábado não: equipes ímpares no primeiro sábado, pares no segundo, alternando.
-    for pos, sab in enumerate(sabados):
-        grupo_sabado = pos % 2
-        grupo_equipe = (equipe_idx - 1) % 2
-        if grupo_sabado == grupo_equipe:
-            datas.append(sab)
 
-    return sorted(datas)
+def ler_roteiro_congelado(file_roteiro):
+    """Lê um roteiro já exportado pelo robô para continuar acompanhamento em outro dia/sessão."""
+    if file_roteiro is None:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    file_roteiro.seek(0)
+    xl = pd.ExcelFile(file_roteiro)
+
+    if "Programacao" in xl.sheet_names:
+        file_roteiro.seek(0)
+        programacao = pd.read_excel(file_roteiro, sheet_name="Programacao")
+    elif "Programação" in xl.sheet_names:
+        file_roteiro.seek(0)
+        programacao = pd.read_excel(file_roteiro, sheet_name="Programação")
+    elif "Consolidado" in xl.sheet_names:
+        file_roteiro.seek(0)
+        consolidado = pd.read_excel(file_roteiro, sheet_name="Consolidado")
+        if "Origem" in consolidado.columns:
+            programacao = consolidado[consolidado["Origem"].astype(str).str.contains("Program", case=False, na=False)].drop(columns=["Origem"], errors="ignore")
+        else:
+            programacao = consolidado.copy()
+    else:
+        file_roteiro.seek(0)
+        programacao = pd.read_excel(file_roteiro, sheet_name=xl.sheet_names[0])
+
+    if "Backlog" in xl.sheet_names:
+        file_roteiro.seek(0)
+        backlog = pd.read_excel(file_roteiro, sheet_name="Backlog")
+    elif "Consolidado" in xl.sheet_names:
+        file_roteiro.seek(0)
+        consolidado = pd.read_excel(file_roteiro, sheet_name="Consolidado")
+        if "Origem" in consolidado.columns:
+            backlog = consolidado[consolidado["Origem"].astype(str).str.contains("Backlog", case=False, na=False)].drop(columns=["Origem"], errors="ignore")
+        else:
+            backlog = pd.DataFrame()
+    else:
+        backlog = pd.DataFrame()
+
+    resumo = pd.DataFrame()
+    if "Resumo Equipes" in xl.sheet_names:
+        file_roteiro.seek(0)
+        resumo = pd.read_excel(file_roteiro, sheet_name="Resumo Equipes")
+
+    return programacao, backlog, resumo
 
 # =========================================================
 # PREPARAÇÃO DAS BASES ORIGINAIS
@@ -243,7 +372,7 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
     df_lista = df_lista.loc[:, ~df_lista.columns.duplicated()].copy()
     df_carga = df_carga.loc[:, ~df_carga.columns.duplicated()].copy()
 
-    # Regra atual de escopo móvel:
+    # Regra de escopo móvel:
     # 1) Tudo que na Lista de Estações está como MÓVEL na unidade responsável; OU
     # 2) Tudo que está com ERIC na equipe responsável.
     col_unidade = encontrar_coluna(df_lista, ["UNIDADE_RESPONSAVEL", "UNIDADE RESPONSAVEL", "UNIDADE_RESPONSÁVEL"], contem=["UNIDADE"])
@@ -289,6 +418,7 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
     col_cluster_lista = encontrar_coluna(df_lista, ["Cluster", "CLUSTER"])
     col_infra = encontrar_coluna(df_lista, ["TIPO DE INFRA", "TIPO_INFRA", "TIPO DE INFRAESTRUTURA"])
     col_endereco = encontrar_coluna(df_lista, ["ENDERECO_CEP", "ENDEREÇO + CEP", "ENDEREÇO", "ENDERECO"])
+    col_municipio = encontrar_coluna(df_lista, ["municipio", "MUNICIPIO", "MUNICÍPIO", "CIDADE"])
     col_lat = encontrar_coluna(df_lista, ["latitude", "LATITUDE"])
     col_lon = encontrar_coluna(df_lista, ["longitude", "LONGITUDE"])
     col_tipo_site = encontrar_coluna(df_lista, ["CLASSIFICAÇÃO HEON", "CLASSIFICACAO HEON", "CLASSIFICAÇÃO", "CLASSIFICACAO", "TIPOLOGIA"])
@@ -297,7 +427,16 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
     if col_lat is None or col_lon is None:
         raise ValueError("A Lista de Estações precisa ter latitude e longitude.")
 
-    for col, nome in [(col_area, "Area"), (col_micro, "Micro_Regiao"), (col_cluster_lista, "Cluster"), (col_infra, "Infraestrutura"), (col_endereco, "Endereco"), (col_tipo_site, "Prioridade"), (col_id_main, "ID_Site_Main")]:
+    for col, nome in [
+        (col_area, "Area"),
+        (col_micro, "Micro_Regiao"),
+        (col_cluster_lista, "Cluster"),
+        (col_infra, "Infraestrutura"),
+        (col_endereco, "Endereco"),
+        (col_municipio, "Municipio"),
+        (col_tipo_site, "Prioridade"),
+        (col_id_main, "ID_Site_Main"),
+    ]:
         if col is None:
             df_lista[nome] = ""
         else:
@@ -306,6 +445,17 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
     df_lista["latitude"] = pd.to_numeric(df_lista[col_lat].astype(str).str.replace(",", ".", regex=False), errors="coerce")
     df_lista["longitude"] = pd.to_numeric(df_lista[col_lon].astype(str).str.replace(",", ".", regex=False), errors="coerce")
     df_lista = df_lista.dropna(subset=["latitude", "longitude"]).copy()
+
+    df_lista["Bairro_Roteiro"] = df_lista["Endereco"].apply(extrair_bairro_endereco)
+    df_lista["Municipio"] = df_lista["Municipio"].fillna("").astype(str).apply(normalizar_valor)
+    df_lista["Regiao_Geo_1km"] = (
+        "GEO | " + df_lista["latitude"].round(2).astype(str) + " | " + df_lista["longitude"].round(2).astype(str)
+    )
+    df_lista["Regiao_Endereco_Bairro"] = np.where(
+        df_lista["Bairro_Roteiro"].astype(str).str.strip().ne(""),
+        df_lista["Municipio"].replace("", "SEM MUNICIPIO") + " | " + df_lista["Bairro_Roteiro"],
+        df_lista["Regiao_Geo_1km"],
+    )
 
     colunas_id_possiveis = ["ID_EBT", "ID_CLARO_FIXO", "ID_NET", "ID_CLARO_OMR", "ID_SITE_MAIN", "SIGLA_CONCAT"]
     colunas_id = [c for c in colunas_id_possiveis if c in df_lista.columns]
@@ -359,9 +509,6 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
 
     df_missoes = df_missoes.merge(df_wo[["Sigla Site", "WO_Climatizacao", "WO_Energia_Eletrica"]], on="Sigla Site", how="left")
 
-    # Quando a carga vem com "Abrir manual" no campo WO, isso não significa que
-    # o site deixou de ser programado; significa que a WO ainda não veio numerada
-    # e precisa de abertura/regularização manual na Claro.
     def montar_observacao_wo(row):
         obs = []
         if "ABRIR MANUAL" in normalizar_valor(row.get("WO_Climatizacao", "")):
@@ -379,9 +526,9 @@ def preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao):
         raise ValueError("Nenhum site da Carga TOA cruzou com a Lista de Estações Móvel.")
 
     if coluna_regiao not in df_roteiro.columns:
-        coluna_regiao = "Cluster" if "Cluster" in df_roteiro.columns else "Area"
+        coluna_regiao = "Regiao_Endereco_Bairro" if "Regiao_Endereco_Bairro" in df_roteiro.columns else "Area"
 
-    df_roteiro["Regiao_Roteiro"] = df_roteiro[coluna_regiao].fillna("").astype(str).str.strip()
+    df_roteiro["Regiao_Roteiro"] = df_roteiro[coluna_regiao].fillna("").astype(str).str.strip().apply(normalizar_valor)
     df_roteiro["Regiao_Roteiro"] = np.where(df_roteiro["Regiao_Roteiro"] == "", "SEM REGIÃO", df_roteiro["Regiao_Roteiro"])
 
     df_roteiro["Prioridade"] = df_roteiro["Prioridade"].fillna("PONTA").astype(str).str.upper()
@@ -441,9 +588,6 @@ def atribuir_regioes_para_equipes(df_tasks, qtd_equipes, capacidade_equipes=None
     for _, reg in resumo_regiao.iterrows():
         peso_regiao = float(reg["Peso_Total"])
 
-        # Escolhe a equipe que ficará mais equilibrada depois de receber esta região.
-        # Isso mantém a regra de não quebrar região entre equipes, mas evita concentrar
-        # regiões pesadas em poucas equipes.
         equipe_escolhida = min(
             carga_equipes.keys(),
             key=lambda eq: (
@@ -500,7 +644,6 @@ def montar_dia_rota(pendentes, data_ref, cap_dia, max_km_dia, priorizar_greenfie
             break
 
         if regiao_aberta:
-            # Enquanto houver site da mesma região, a equipe continua matando a região.
             cand_mesma = candidatos[candidatos["Regiao_Roteiro"] == regiao_aberta].copy()
             if not cand_mesma.empty:
                 candidatos = cand_mesma
@@ -570,7 +713,6 @@ def roteirizar(df_tasks, qtd_equipes, data_inicio, data_fim, cap_dia, max_km_dia
             else:
                 slots.append({"Equipe": equipe, "Data": pd.Timestamp(data_ref), "Capacidade_Total": cap_dia, "Capacidade_Usada": 0, "Qtd_Tarefas": 0, "Km_Dia": 0.0})
 
-        # O que sobrou da equipe vira backlog.
         if not pendentes_eq.empty:
             df_tasks.loc[pendentes_eq.index, "__BACKLOG__"] = True
 
@@ -586,7 +728,6 @@ def calcular_distancia_sequencial(df):
         return df.copy()
 
     df = df.copy().reset_index(drop=True)
-    # Reordena internamente por proximidade, mas sem trocar de equipe/data.
     if len(df) > 1:
         pend = df.copy()
         saida = []
@@ -636,31 +777,11 @@ def formatar_saida(df, cap_dia, backlog=False):
         df["Ordem"] = "Cap. consumida: " + df["Capacidade_Consumida"].astype(int).astype(str) + f"/{cap_dia}"
 
     colunas = [
-        "Data Programada",
-        "Sequencia_Atendimento",
-        "Ordem",
-        "Prioridade",
-        "Infraestrutura",
-        "Area",
-        "Micro_Regiao",
-        "Sigla Site Anterior",
-        "Sigla Site",
-        "Endereco",
-        "Equipe",
-        "Tecnico",
-        "Detalhe_Visita",
-        "WO_Climatizacao",
-        "WO_Energia_Eletrica",
-        "Peso_Slots",
-        "Km_Site_Anterior",
-        "Km_Acumulado_Dia",
-        "latitude",
-        "longitude",
-        "Regiao_Roteiro",
-        "ID_Site_Main",
-        "Regra_Escopo_Movel",
-        "Particularidade_Acesso",
-        "Observacao_WO_Carga",
+        "Data Programada", "Sequencia_Atendimento", "Ordem", "Prioridade", "Infraestrutura",
+        "Area", "Micro_Regiao", "Municipio", "Bairro_Roteiro", "Regiao_Roteiro",
+        "Sigla Site Anterior", "Sigla Site", "Endereco", "Equipe", "Tecnico", "Detalhe_Visita",
+        "WO_Climatizacao", "WO_Energia_Eletrica", "Peso_Slots", "Km_Site_Anterior", "Km_Acumulado_Dia",
+        "latitude", "longitude", "ID_Site_Main", "Regra_Escopo_Movel", "Particularidade_Acesso", "Observacao_WO_Carga",
     ]
     for c in colunas:
         if c not in df.columns:
@@ -689,8 +810,225 @@ def montar_resumo_equipes(df_slots, df_programacao):
     resumo["TOTAL KM rodado mês"] = resumo["TOTAL KM rodado mês"].round(2)
     return resumo[["Area", "Equipe", "Tecnico", "Dias_Disponiveis", "Dias_Com_Rota", "Qtd_Tarefas", "Capacidade_Total", "Capacidade_Usada", "Saldo_Capacidade", "Utilizacao_%", "TOTAL KM rodado mês"]]
 
+# =========================================================
+# ACOMPANHAMENTO / EXECUÇÃO
+# =========================================================
+def split_wos(valor):
+    if pd.isna(valor):
+        return []
+    txt = str(valor).strip()
+    if not txt or txt.upper() in {"NAN", "NONE", "NULL"}:
+        return []
+    partes = [p.strip() for p in re.split(r"\s*\|\s*|\s*,\s*|\s*;\s*", txt) if p.strip()]
+    return partes
 
-def gerar_excel_exportacao(df_programacao, df_backlog, df_resumo):
+
+def expandir_programacao_por_wo(df_programacao):
+    registros = []
+    if df_programacao.empty:
+        return pd.DataFrame()
+
+    for idx, row in df_programacao.reset_index(drop=True).iterrows():
+        detalhe = normalizar_valor(row.get("Detalhe_Visita", ""))
+        categorias = []
+        if "CLIMA" in detalhe or "CLIMAT" in detalhe:
+            categorias.append(("CLIMATIZACAO", "WO_Climatizacao", "Climatização"))
+        if "ENERGIA" in detalhe or "ELETR" in detalhe:
+            categorias.append(("ENERGIA_ELETRICA", "WO_Energia_Eletrica", "Energia"))
+
+        if not categorias:
+            categorias = [("CLIMATIZACAO", "WO_Climatizacao", "Climatização"), ("ENERGIA_ELETRICA", "WO_Energia_Eletrica", "Energia")]
+
+        for categoria, col_wo, tipo_label in categorias:
+            wos = split_wos(row.get(col_wo, ""))
+            if not wos:
+                wos = [""]
+            for wo in wos:
+                registros.append({
+                    "Indice_Programacao": idx,
+                    "Sigla Site": row.get("Sigla Site", ""),
+                    "Site_Normalizado": normalizar_site(row.get("Sigla Site", "")),
+                    "Data Programada": row.get("Data Programada", ""),
+                    "Data_Programada_dt": pd.to_datetime(row.get("Data Programada", ""), dayfirst=True, errors="coerce"),
+                    "Equipe": row.get("Equipe", ""),
+                    "Regiao_Roteiro": row.get("Regiao_Roteiro", ""),
+                    "Categoria_Preventiva": categoria,
+                    "Tipo Preventiva Programada": tipo_label,
+                    "WO_Programada": wo,
+                    "WO_Normalizada": normalizar_wo(wo),
+                })
+    return pd.DataFrame(registros)
+
+
+def preparar_cronograma_execucao(df_cronograma):
+    if df_cronograma.empty:
+        return pd.DataFrame()
+    df = df_cronograma.loc[:, ~df_cronograma.columns.duplicated()].copy()
+    col_site = encontrar_coluna(df, ["Site", "Sigla Site", "programado/INFRATEL"], contem=["SITE"])
+    col_wo = encontrar_coluna(df, ["WO", "W.O", "Ordem de Serviço"], contem=["WO"])
+    col_tipo = encontrar_coluna(df, ["Tipo Preventiva", "tipo_preventiva", "clr_sdr_tipo_preventiva"], contem=["PREVENTIVA"])
+    col_status = encontrar_coluna(df, ["STATUS", "Status", "Status WO"])
+    col_expurgo = encontrar_coluna(df, ["Expurgo", "EXPURGO"])
+
+    if col_site is None:
+        raise ValueError("Não encontrei a coluna de Site no Cronograma Preventivas.")
+    if col_wo is None:
+        df["__WO__"] = ""
+        col_wo = "__WO__"
+    if col_tipo is None:
+        df["__TIPO__"] = ""
+        col_tipo = "__TIPO__"
+    if col_status is None:
+        df["__STATUS__"] = ""
+        col_status = "__STATUS__"
+    if col_expurgo is None:
+        df["__EXPURGO__"] = "NÃO"
+        col_expurgo = "__EXPURGO__"
+
+    saida = pd.DataFrame({
+        "Site_Cronograma": df[col_site],
+        "Site_Normalizado": df[col_site].apply(normalizar_site),
+        "WO_Cronograma": df[col_wo],
+        "WO_Normalizada": df[col_wo].apply(normalizar_wo),
+        "Tipo_Preventiva_Cronograma": df[col_tipo],
+        "Categoria_Preventiva": df[col_tipo].apply(classificar_tipo_wo),
+        "Status_Cronograma": df[col_status],
+        "Expurgo_Cronograma": df[col_expurgo],
+    })
+
+    def status_linha(row):
+        exp = normalizar_valor(row.get("Expurgo_Cronograma", ""))
+        status = normalizar_valor(row.get("Status_Cronograma", ""))
+        if exp in {"SIM", "S", "YES", "Y"}:
+            return "EXPURGO"
+        if "100" in status or "EXEC" in status or "CONCL" in status or "REALIZ" in status or "VALID" in status:
+            return "REALIZADO"
+        if status in {"", "0", "0%", "NAN", "NONE"} or "0%" in status:
+            return "NÃO REALIZADO"
+        return "EM ANDAMENTO"
+
+    saida["Status_Execucao_WO"] = saida.apply(status_linha, axis=1)
+    return saida
+
+
+def avaliar_execucao(df_programacao, df_backlog, df_cronograma, data_apuracao):
+    prog_exp = expandir_programacao_por_wo(df_programacao)
+    cron = preparar_cronograma_execucao(df_cronograma)
+
+    if prog_exp.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    cron_wo = cron[cron["WO_Normalizada"].ne("")].drop_duplicates(subset=["WO_Normalizada"], keep="last").set_index("WO_Normalizada")
+    cron_site_tipo = (
+        cron.sort_values(["Site_Normalizado", "Categoria_Preventiva"])
+        .drop_duplicates(subset=["Site_Normalizado", "Categoria_Preventiva"], keep="last")
+        .set_index(["Site_Normalizado", "Categoria_Preventiva"])
+    )
+
+    linhas = []
+    for _, row in prog_exp.iterrows():
+        match = None
+        metodo = "SEM MATCH"
+        wo_norm = row.get("WO_Normalizada", "")
+        chave_st = (row.get("Site_Normalizado", ""), row.get("Categoria_Preventiva", ""))
+        if wo_norm and wo_norm in cron_wo.index:
+            match = cron_wo.loc[wo_norm]
+            metodo = "WO"
+        elif chave_st in cron_site_tipo.index:
+            match = cron_site_tipo.loc[chave_st]
+            metodo = "SITE + TIPO"
+
+        item = row.to_dict()
+        if match is not None:
+            item.update({
+                "WO_Cronograma": match.get("WO_Cronograma", ""),
+                "Status_Cronograma": match.get("Status_Cronograma", ""),
+                "Expurgo_Cronograma": match.get("Expurgo_Cronograma", ""),
+                "Status_Execucao_WO": match.get("Status_Execucao_WO", ""),
+                "Metodo_Match": metodo,
+            })
+        else:
+            item.update({
+                "WO_Cronograma": "",
+                "Status_Cronograma": "NÃO ENCONTRADO NA BASE DE EXECUÇÃO",
+                "Expurgo_Cronograma": "",
+                "Status_Execucao_WO": "NÃO REALIZADO",
+                "Metodo_Match": metodo,
+            })
+        linhas.append(item)
+
+    acompanhamento_wo = pd.DataFrame(linhas)
+    data_ap = pd.Timestamp(data_apuracao)
+
+    resumo = (
+        acompanhamento_wo.groupby("Indice_Programacao", as_index=False)
+        .agg(
+            Qtd_WO_Programadas=("WO_Programada", "count"),
+            Qtd_WO_Realizadas=("Status_Execucao_WO", lambda x: int((pd.Series(x) == "REALIZADO").sum())),
+            Qtd_WO_Expurgo=("Status_Execucao_WO", lambda x: int((pd.Series(x) == "EXPURGO").sum())),
+            Status_WO_Detalhe=("Status_Execucao_WO", lambda x: " | ".join(pd.Series(x).astype(str).unique())),
+            Status_Cronograma=("Status_Cronograma", lambda x: " | ".join(pd.Series(x).astype(str).unique()[:5])),
+            Metodo_Match=("Metodo_Match", lambda x: " | ".join(pd.Series(x).astype(str).unique())),
+        )
+    )
+
+    acomp = df_programacao.reset_index(drop=True).copy()
+    acomp["Indice_Programacao"] = acomp.index
+    acomp = acomp.merge(resumo, on="Indice_Programacao", how="left")
+    acomp["Data_Programada_dt"] = pd.to_datetime(acomp["Data Programada"], dayfirst=True, errors="coerce")
+    acomp["Qtd_WO_Programadas"] = acomp["Qtd_WO_Programadas"].fillna(0).astype(int)
+    acomp["Qtd_WO_Realizadas"] = acomp["Qtd_WO_Realizadas"].fillna(0).astype(int)
+    acomp["Qtd_WO_Expurgo"] = acomp["Qtd_WO_Expurgo"].fillna(0).astype(int)
+    acomp["Qtd_WO_Consideradas"] = (acomp["Qtd_WO_Programadas"] - acomp["Qtd_WO_Expurgo"]).clip(lower=0)
+
+    def status_site(row):
+        if pd.notna(row["Data_Programada_dt"]) and row["Data_Programada_dt"] > data_ap:
+            return "A FUTURO"
+        if int(row["Qtd_WO_Consideradas"]) == 0 and int(row["Qtd_WO_Expurgo"]) > 0:
+            return "EXPURGO"
+        if int(row["Qtd_WO_Consideradas"]) > 0 and int(row["Qtd_WO_Realizadas"]) >= int(row["Qtd_WO_Consideradas"]):
+            return "REALIZADO"
+        if int(row["Qtd_WO_Realizadas"]) > 0:
+            return "REALIZADO PARCIAL"
+        return "PERDIDO / REPROGRAMAR"
+
+    acomp["Status_Acompanhamento"] = acomp.apply(status_site, axis=1)
+    acomp["Data_Apuracao"] = pd.Timestamp(data_apuracao).strftime("%d/%m/%Y")
+
+    realizados = acomp[acomp["Status_Acompanhamento"].eq("REALIZADO")].copy()
+    perdidos = acomp[acomp["Status_Acompanhamento"].isin(["PERDIDO / REPROGRAMAR", "REALIZADO PARCIAL"])].copy()
+
+    reprogramar_partes = []
+    if not perdidos.empty:
+        perd = perdidos.copy()
+        perd["Origem_Reprogramacao"] = np.where(perd["Status_Acompanhamento"].eq("REALIZADO PARCIAL"), "Realizado parcial", "Perdido da programação")
+        perd["Motivo_Reprogramacao"] = perd["Status_Acompanhamento"]
+        reprogramar_partes.append(perd)
+    if not df_backlog.empty:
+        back = df_backlog.copy()
+        back["Origem_Reprogramacao"] = "Backlog original"
+        back["Motivo_Reprogramacao"] = "Não entrou na programação anterior"
+        back["Status_Acompanhamento"] = "BACKLOG ORIGINAL"
+        back["Data_Apuracao"] = pd.Timestamp(data_apuracao).strftime("%d/%m/%Y")
+        reprogramar_partes.append(back)
+
+    reprogramar = pd.concat(reprogramar_partes, ignore_index=True, sort=False) if reprogramar_partes else pd.DataFrame()
+
+    resumo_exec = pd.DataFrame([
+        {"Indicador": "Sites programados", "Valor": len(acomp)},
+        {"Indicador": "Realizados", "Valor": len(realizados)},
+        {"Indicador": "Perdidos/Reprogramar", "Valor": len(perdidos)},
+        {"Indicador": "Backlog original", "Valor": len(df_backlog)},
+        {"Indicador": "Total para reprogramar", "Valor": len(reprogramar)},
+        {"Indicador": "Data de apuração", "Valor": pd.Timestamp(data_apuracao).strftime("%d/%m/%Y")},
+    ])
+
+    return acomp, realizados, perdidos, reprogramar, resumo_exec
+
+# =========================================================
+# EXPORTAÇÕES
+# =========================================================
+def gerar_excel_exportacao(df_programacao, df_backlog, df_resumo, df_resumo_regiao=None):
     output = BytesIO()
     partes = []
     if not df_programacao.empty:
@@ -704,22 +1042,23 @@ def gerar_excel_exportacao(df_programacao, df_backlog, df_resumo):
     df_consolidado = pd.concat(partes, ignore_index=True, sort=False) if partes else pd.DataFrame()
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_consolidado.to_excel(writer, sheet_name="Consolidado", index=False)
-        df_programacao.to_excel(writer, sheet_name="Programacao", index=False)
-        df_backlog.to_excel(writer, sheet_name="Backlog", index=False)
-        df_resumo.to_excel(writer, sheet_name="Resumo Equipes", index=False)
-
-        workbook = writer.book
-        header_fmt = workbook.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF", "border": 1, "text_wrap": True, "valign": "vcenter"})
-        body_fmt = workbook.add_format({"border": 1, "border_color": "#D9E2F3", "valign": "top"})
-        date_fmt = workbook.add_format({"num_format": "dd/mm/yyyy", "border": 1, "border_color": "#D9E2F3"})
-
-        for sheet_name, dataframe in {
+        abas = {
             "Consolidado": df_consolidado,
             "Programacao": df_programacao,
             "Backlog": df_backlog,
             "Resumo Equipes": df_resumo,
-        }.items():
+        }
+        if df_resumo_regiao is not None and not df_resumo_regiao.empty:
+            abas["Resumo Regioes"] = df_resumo_regiao
+
+        for sheet_name, dataframe in abas.items():
+            dataframe.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        workbook = writer.book
+        header_fmt = workbook.add_format({"bold": True, "bg_color": "#1F4E78", "font_color": "#FFFFFF", "border": 1, "text_wrap": True, "valign": "vcenter"})
+        body_fmt = workbook.add_format({"border": 1, "border_color": "#D9E2F3", "valign": "top"})
+
+        for sheet_name, dataframe in abas.items():
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 0)
             if dataframe.empty:
@@ -727,12 +1066,132 @@ def gerar_excel_exportacao(df_programacao, df_backlog, df_resumo):
             for col_num, col_name in enumerate(dataframe.columns):
                 ws.write(0, col_num, col_name, header_fmt)
                 largura = max(12, min(42, dataframe[col_name].astype(str).map(len).max() + 2))
-                if col_name in {"Endereco", "Particularidade_Acesso"}:
+                if col_name in {"Endereco", "Particularidade_Acesso", "Status_Cronograma"}:
                     largura = 38
                 ws.set_column(col_num, col_num, largura, body_fmt)
             ws.autofilter(0, 0, len(dataframe), len(dataframe.columns) - 1)
 
     return output.getvalue()
+
+
+def gerar_excel_acompanhamento(df_acomp, df_realizados, df_perdidos, df_reprogramar, df_resumo_exec):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        abas = {
+            "Resumo Execucao": df_resumo_exec,
+            "Acompanhamento": df_acomp,
+            "Realizados": df_realizados,
+            "Perdidos": df_perdidos,
+            "Reprogramar": df_reprogramar,
+        }
+        for sheet_name, df in abas.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        workbook = writer.book
+        header_fmt = workbook.add_format({"bold": True, "bg_color": "#7030A0", "font_color": "#FFFFFF", "border": 1, "text_wrap": True})
+        body_fmt = workbook.add_format({"border": 1, "border_color": "#E4D7F5", "valign": "top"})
+        for sheet_name, df in abas.items():
+            ws = writer.sheets[sheet_name]
+            ws.freeze_panes(1, 0)
+            if df.empty:
+                continue
+            for col_num, col_name in enumerate(df.columns):
+                ws.write(0, col_num, col_name, header_fmt)
+                largura = max(12, min(42, df[col_name].astype(str).map(len).max() + 2))
+                if col_name in {"Endereco", "Particularidade_Acesso", "Status_Cronograma"}:
+                    largura = 38
+                ws.set_column(col_num, col_num, largura, body_fmt)
+            ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+    return output.getvalue()
+
+# =========================================================
+# MAPA / MINI DASH
+# =========================================================
+def cor_por_equipe(equipe):
+    palette = [
+        [31, 119, 180], [255, 127, 14], [44, 160, 44], [214, 39, 40],
+        [148, 103, 189], [140, 86, 75], [227, 119, 194], [127, 127, 127],
+        [188, 189, 34], [23, 190, 207], [37, 99, 235], [236, 72, 153],
+        [16, 185, 129], [245, 158, 11], [239, 68, 68], [99, 102, 241],
+    ]
+    m = re.search(r"(\d+)", str(equipe))
+    idx = int(m.group(1)) - 1 if m else abs(hash(str(equipe)))
+    return palette[idx % len(palette)]
+
+
+def preparar_mapa(df):
+    mapa = df.copy()
+    mapa["latitude"] = pd.to_numeric(mapa["latitude"], errors="coerce")
+    mapa["longitude"] = pd.to_numeric(mapa["longitude"], errors="coerce")
+    mapa = mapa.dropna(subset=["latitude", "longitude"]).copy()
+    if mapa.empty:
+        return mapa
+    cores = mapa["Equipe"].apply(cor_por_equipe)
+    mapa["Cor_R"] = [c[0] for c in cores]
+    mapa["Cor_G"] = [c[1] for c in cores]
+    mapa["Cor_B"] = [c[2] for c in cores]
+    mapa["Tooltip"] = (
+        "Equipe: " + mapa["Equipe"].astype(str) + "\n" +
+        "Site: " + mapa["Sigla Site"].astype(str) + "\n" +
+        "Região: " + mapa["Regiao_Roteiro"].astype(str) + "\n" +
+        "Endereço: " + mapa["Endereco"].astype(str)
+    )
+    return mapa
+
+
+def exibir_mapa_programacao(df_programacao):
+    if df_programacao.empty:
+        st.info("Nenhum ponto para exibir no mapa.")
+        return
+
+    datas = sorted(df_programacao["Data Programada"].dropna().astype(str).unique().tolist(), key=lambda x: pd.to_datetime(x, dayfirst=True, errors="coerce"))
+    data_sel = st.selectbox("Selecione o dia para ver a atuação das equipes", datas)
+    df_dia = df_programacao[df_programacao["Data Programada"].astype(str).eq(str(data_sel))].copy()
+    mapa = preparar_mapa(df_dia)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Sites no dia", len(df_dia))
+    c2.metric("Equipes ativas", df_dia["Equipe"].nunique())
+    c3.metric("Peso do dia", int(pd.to_numeric(df_dia["Peso_Slots"], errors="coerce").fillna(0).sum()))
+    c4.metric("Com particularidade", int((df_dia["Particularidade_Acesso"].astype(str).str.strip() != "").sum()) if "Particularidade_Acesso" in df_dia.columns else 0)
+
+    if mapa.empty:
+        st.warning("Os sites deste dia estão sem latitude/longitude válida.")
+        return
+
+    center = {"lat": float(mapa["latitude"].mean()), "lon": float(mapa["longitude"].mean())}
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=mapa,
+        get_position="[longitude, latitude]",
+        get_radius=130,
+        get_fill_color="[Cor_R, Cor_G, Cor_B, 185]",
+        get_line_color="[255, 255, 255]",
+        line_width_min_pixels=1,
+        pickable=True,
+    )
+    text_layer = pdk.Layer(
+        "TextLayer",
+        data=mapa,
+        get_position="[longitude, latitude]",
+        get_text="Sigla Site",
+        get_size=11,
+        get_color="[20, 20, 20]",
+        get_angle=0,
+        get_text_anchor="middle",
+        get_alignment_baseline="bottom",
+    )
+    view_state = pdk.ViewState(latitude=center["lat"], longitude=center["lon"], zoom=10.5, pitch=0)
+    tooltip = {"text": "{Tooltip}"}
+    st.pydeck_chart(pdk.Deck(layers=[layer, text_layer], initial_view_state=view_state, tooltip=tooltip, map_style="light"), use_container_width=True)
+
+    equipes = sorted(mapa["Equipe"].dropna().astype(str).unique().tolist())
+    legenda = "".join(
+        f'<span class="legend-pill"><span class="dot" style="background: rgb({cor_por_equipe(eq)[0]}, {cor_por_equipe(eq)[1]}, {cor_por_equipe(eq)[2]});"></span>{eq}</span>'
+        for eq in equipes
+    )
+    st.markdown(legenda, unsafe_allow_html=True)
+    st.dataframe(df_dia, use_container_width=True, hide_index=True)
 
 # =========================================================
 # SIDEBAR / ENTRADAS
@@ -760,13 +1219,28 @@ with st.sidebar:
 
     st.divider()
     st.header("🗺️ Região")
-    coluna_regiao = st.selectbox("Coluna usada para travar região na mesma equipe", ["Cluster", "Micro_Regiao", "Area", "municipio"], index=0)
+    opcoes_regiao = {
+        "Endereço/Bairro (recomendado)": "Regiao_Endereco_Bairro",
+        "Geo 1km (latitude/longitude)": "Regiao_Geo_1km",
+        "Cluster": "Cluster",
+        "Micro região": "Micro_Regiao",
+        "Área": "Area",
+        "Município": "Municipio",
+    }
+    coluna_regiao_label = st.selectbox("Coluna usada para travar região na mesma equipe", list(opcoes_regiao.keys()), index=0)
+    coluna_regiao = opcoes_regiao[coluna_regiao_label]
+
+    st.divider()
+    st.header("📌 Acompanhamento")
+    file_cronograma = st.file_uploader("Cronograma Preventivas / base realizada", type=["xlsx", "xls"], key="cronograma_execucao")
+    file_roteiro_congelado = st.file_uploader("Roteiro congelado/anterior (opcional)", type=["xlsx", "xls"], key="roteiro_congelado_upload", help="Use quando você fechou o app e quer acompanhar uma roteirização gerada anteriormente.")
+    data_apuracao = st.date_input("Apurar realizado até", hoje)
 
 # =========================================================
-# EXECUÇÃO
+# EXECUÇÃO DA ROTEIRIZAÇÃO
 # =========================================================
 if file_lista and file_carga:
-    st.markdown('<div class="section-card"><b>Pronto para gerar.</b><br><span class="muted">O robô vai filtrar UF = SPC, escopo MÓVEL e/ou ERIC, somente Climatização/Energia, agrupar por região e exportar no padrão do roteiro.</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-card"><b>Pronto para gerar.</b><br><span class="muted">O robô vai filtrar UF = SPC, escopo MÓVEL e/ou ERIC, somente Climatização/Energia, agrupar por bairro/região e exportar no padrão do roteiro.</span></div>', unsafe_allow_html=True)
 
     if st.button("🚀 Gerar roteiro móvel", type="primary", use_container_width=True):
         try:
@@ -783,7 +1257,7 @@ if file_lista and file_carga:
             df_tasks = preparar_programacao(df_lista, df_carga, df_acessos, coluna_regiao)
             progress.progress(45)
 
-            status.info("Distribuindo regiões entre as equipes...")
+            status.info("Distribuindo bairros/regiões entre as equipes de forma balanceada...")
             data_limite_green = data_greenfield_ate if priorizar_greenfield else None
             prog_raw, backlog_raw, slots, resumo_regiao, mapa_regioes = roteirizar(
                 df_tasks,
@@ -797,11 +1271,11 @@ if file_lista and file_carga:
             )
             progress.progress(75)
 
-            status.info("Formatando saída no padrão do roteiro...")
+            status.info("Formatando saída no padrão do roteiro e congelando a programação...")
             df_programacao = formatar_saida(prog_raw, int(cap_dia), backlog=False)
             df_backlog = formatar_saida(backlog_raw, int(cap_dia), backlog=True)
             df_resumo = montar_resumo_equipes(slots, df_programacao)
-            excel = gerar_excel_exportacao(df_programacao, df_backlog, df_resumo)
+            excel = gerar_excel_exportacao(df_programacao, df_backlog, df_resumo, resumo_regiao)
             progress.progress(100)
             status.empty()
 
@@ -809,9 +1283,11 @@ if file_lista and file_carga:
             st.session_state["df_backlog"] = df_backlog
             st.session_state["df_resumo"] = df_resumo
             st.session_state["df_tasks"] = df_tasks
+            st.session_state["df_resumo_regiao"] = resumo_regiao
             st.session_state["excel"] = excel
             st.session_state["aba_carga"] = aba_carga
-            st.success("Roteiro gerado com sucesso!")
+            st.session_state["roteiro_congelado_em"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+            st.success("Roteiro gerado e congelado com sucesso!")
 
         except Exception as e:
             st.error(f"Erro ao gerar roteiro: {e}")
@@ -819,36 +1295,117 @@ else:
     st.info("Suba a Lista de Estações e a Carga TOA para liberar a geração. A Base Acessos é opcional, mas recomendada.")
 
 # =========================================================
-# RESULTADOS
+# CARREGAMENTO DE ROTEIRO CONGELADO/ANTERIOR
+# =========================================================
+if "df_programacao" not in st.session_state and file_roteiro_congelado is not None:
+    try:
+        df_prog_ant, df_back_ant, df_res_ant = ler_roteiro_congelado(file_roteiro_congelado)
+        st.session_state["df_programacao"] = df_prog_ant
+        st.session_state["df_backlog"] = df_back_ant
+        st.session_state["df_resumo"] = df_res_ant
+        st.session_state["df_tasks"] = pd.concat([df_prog_ant, df_back_ant], ignore_index=True, sort=False) if not df_back_ant.empty else df_prog_ant.copy()
+        st.session_state["df_resumo_regiao"] = pd.DataFrame()
+        st.session_state["excel"] = gerar_excel_exportacao(df_prog_ant, df_back_ant, df_res_ant)
+        st.session_state["aba_carga"] = "Roteiro congelado/anterior"
+        st.session_state["roteiro_congelado_em"] = "Carregado de arquivo"
+        st.success("Roteiro congelado/anterior carregado para acompanhamento.")
+    except Exception as e:
+        st.error(f"Não consegui carregar o roteiro congelado/anterior: {e}")
+
+# =========================================================
+# RESULTADOS / MINI DASH
 # =========================================================
 if "df_programacao" in st.session_state:
     df_programacao = st.session_state["df_programacao"]
     df_backlog = st.session_state["df_backlog"]
     df_resumo = st.session_state["df_resumo"]
     df_tasks = st.session_state["df_tasks"]
+    df_resumo_regiao = st.session_state.get("df_resumo_regiao", pd.DataFrame())
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Sites roteirizados", f"{len(df_programacao):,}".replace(",", "."))
-    c2.metric("Backlog", f"{len(df_backlog):,}".replace(",", "."))
-    c3.metric("Peso programado", f"{int(pd.to_numeric(df_programacao.get('Peso_Slots', pd.Series(dtype=float)), errors='coerce').fillna(0).sum()):,}".replace(",", "."))
-    c4.metric("Com particularidade", f"{int((df_programacao.get('Particularidade_Acesso', pd.Series(dtype=str)).astype(str).str.strip() != '').sum()):,}".replace(",", "."))
+    total_roteirizavel = len(df_tasks)
+    programados = len(df_programacao)
+    backlog = len(df_backlog)
+    peso_programado = int(pd.to_numeric(df_programacao.get("Peso_Slots", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    particularidade = int((df_programacao.get("Particularidade_Acesso", pd.Series(dtype=str)).astype(str).str.strip() != "").sum())
+    pct_prog = (programados / total_roteirizavel * 100) if total_roteirizavel else 0
 
-    st.caption(f"Carga TOA lida pela aba: {st.session_state.get('aba_carga', '')}")
+    render_kpis([
+        kpi_card("Sites roteirizáveis", f"{total_roteirizavel:,}".replace(",", "."), "Após filtros: SPC + Móvel/ERIC + Clima/Energia"),
+        kpi_card("Sites programados", f"{programados:,}".replace(",", "."), f"{pct_prog:.1f}% do escopo filtrado".replace(".", ",")),
+        kpi_card("Sites sem programação", f"{backlog:,}".replace(",", "."), "Entraram no backlog"),
+        kpi_card("Peso programado", f"{peso_programado:,}".replace(",", "."), f"{particularidade} com particularidade de acesso"),
+    ])
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📋 Programação", "⚠️ Backlog", "📊 Resumo Equipes", "🔎 Base filtrada"])
+    st.caption(f"Carga TOA lida pela aba: {st.session_state.get('aba_carga', '')} | Roteirização congelada em: {st.session_state.get('roteiro_congelado_em', '')}")
+
+    df_acomp = df_realizados = df_perdidos = df_reprogramar = df_resumo_exec = pd.DataFrame()
+    excel_acomp = None
+    if file_cronograma is not None:
+        try:
+            df_cronograma = ler_cronograma_preventivas(file_cronograma)
+            df_acomp, df_realizados, df_perdidos, df_reprogramar, df_resumo_exec = avaliar_execucao(
+                df_programacao,
+                df_backlog,
+                df_cronograma,
+                data_apuracao,
+            )
+            excel_acomp = gerar_excel_acompanhamento(df_acomp, df_realizados, df_perdidos, df_reprogramar, df_resumo_exec)
+            st.session_state["df_acomp"] = df_acomp
+            st.session_state["df_realizados"] = df_realizados
+            st.session_state["df_perdidos"] = df_perdidos
+            st.session_state["df_reprogramar"] = df_reprogramar
+            st.session_state["df_resumo_exec"] = df_resumo_exec
+            st.session_state["excel_acomp"] = excel_acomp
+
+            render_kpis([
+                kpi_card("Realizados", f"{len(df_realizados):,}".replace(",", "."), "Programados que constam como 100%/executados"),
+                kpi_card("Perdidos", f"{len(df_perdidos):,}".replace(",", "."), "Programados até a apuração e não realizados"),
+                kpi_card("Reprogramar", f"{len(df_reprogramar):,}".replace(",", "."), "Perdidos + backlog original"),
+                kpi_card("Data apuração", pd.Timestamp(data_apuracao).strftime("%d/%m"), "Base de execução carregada"),
+            ])
+        except Exception as e:
+            st.warning(f"Não consegui cruzar a base realizada ainda: {e}")
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🗺️ Mapa diário", "📋 Programação", "⚠️ Backlog", "📌 Acompanhamento", "📊 Resumo", "🔎 Base filtrada"])
     with tab1:
-        st.dataframe(df_programacao, use_container_width=True, hide_index=True)
+        exibir_mapa_programacao(df_programacao)
     with tab2:
-        st.dataframe(df_backlog, use_container_width=True, hide_index=True)
+        st.dataframe(df_programacao, use_container_width=True, hide_index=True)
     with tab3:
-        st.dataframe(df_resumo, use_container_width=True, hide_index=True)
+        st.dataframe(df_backlog, use_container_width=True, hide_index=True)
     with tab4:
+        if not df_acomp.empty:
+            subtab1, subtab2, subtab3, subtab4 = st.tabs(["Acompanhamento", "Realizados", "Perdidos", "Reprogramar"])
+            with subtab1:
+                st.dataframe(df_acomp, use_container_width=True, hide_index=True)
+            with subtab2:
+                st.dataframe(df_realizados, use_container_width=True, hide_index=True)
+            with subtab3:
+                st.dataframe(df_perdidos, use_container_width=True, hide_index=True)
+            with subtab4:
+                st.dataframe(df_reprogramar, use_container_width=True, hide_index=True)
+            st.download_button(
+                "📥 Baixar base de acompanhamento/reprogramação",
+                st.session_state.get("excel_acomp", excel_acomp),
+                file_name="acompanhamento_reprogramacao_movel.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            st.info("Suba o Cronograma Preventivas na barra lateral para atualizar realizado, perdido e reprogramação contra a última roteirização congelada.")
+    with tab5:
+        st.subheader("Resumo por equipe")
+        st.dataframe(df_resumo, use_container_width=True, hide_index=True)
+        if not df_resumo_regiao.empty:
+            st.subheader("Resumo por região/bairro")
+            st.dataframe(df_resumo_regiao, use_container_width=True, hide_index=True)
+    with tab6:
         st.dataframe(df_tasks, use_container_width=True, hide_index=True)
 
     st.download_button(
-        "📥 Baixar Excel Completo",
+        "📥 Baixar Excel Completo do Roteiro",
         st.session_state["excel"],
-        file_name="roteiro_movel_planejado_v4.xlsx",
+        file_name="roteiro_movel_planejado_v6.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
